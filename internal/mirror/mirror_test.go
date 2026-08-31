@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -103,7 +104,7 @@ func TestRsyncArgsExplicitExcludesReplaceDefaults(t *testing.T) {
 func TestRunScript(t *testing.T) {
 	got := RunScript("~/w/mirror", "bundle install --quiet", []string{"bin/rails", "test"})
 
-	if !strings.HasPrefix(got, "cd ") {
+	if !strings.Contains(got, "cd ") {
 		t.Errorf("should cd into the mirror first: %q", got)
 	}
 	// A failed setup must report itself rather than surfacing later as a
@@ -123,10 +124,20 @@ func TestRunScriptWithoutSetup(t *testing.T) {
 	}
 }
 
-func TestRunScriptQuotesArguments(t *testing.T) {
-	got := RunScript("/m", "", []string{"ruby", "-e", "puts 'hi there'"})
-	if !strings.Contains(got, `'puts '\''hi there'\'''`) {
-		t.Errorf("arguments must survive the remote shell: %q", got)
+// The command now crosses two shells — ssh's, then the login shell — so assert
+// the arguments actually survive rather than restating the escaping.
+func TestRunScriptArgumentsSurviveBothShells(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh available")
+	}
+	script := RunScript(".", "", []string{"printf", "%s|%s", "a b", "it's"})
+
+	out, err := exec.Command("sh", "-c", "SHELL=/bin/sh; "+script).Output()
+	if err != nil {
+		t.Fatalf("script rejected by the shell: %v", err)
+	}
+	if got, want := string(out), "a b|it's"; got != want {
+		t.Errorf("arguments did not survive: got %q, want %q", got, want)
 	}
 }
 
@@ -200,5 +211,22 @@ func TestRunScriptExpandsTildeInCd(t *testing.T) {
 	}
 	if !strings.Contains(got, `cd "$HOME"/w/.on-mirrors/app-abc`) {
 		t.Errorf("tilde should expand on the remote: %q", got)
+	}
+}
+
+func TestRunScriptUsesLoginShell(t *testing.T) {
+	// ssh without a tty starts a non-login shell, so ~/.profile never runs and
+	// version-managed tools are not on PATH. Setup fails first, with
+	// "bundle: not found", which looks like a broken host rather than a missing
+	// environment.
+	got := RunScript("/m", "bundle install", []string{"bin/rails", "test"})
+	if !strings.HasPrefix(got, "${SHELL:-/bin/sh} -lc ") {
+		t.Errorf("should run through a login shell: %q", got)
+	}
+	// The cd, setup and command must all share that shell's environment.
+	for _, part := range []string{"cd /m", "bundle install", "exec bin/rails test"} {
+		if !strings.Contains(got, part) {
+			t.Errorf("missing %q in %q", part, got)
+		}
 	}
 }

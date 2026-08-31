@@ -180,17 +180,26 @@ func RsyncArgs(target, localPath, remotePath string, o Options) []string {
 // RunScript is the remote script that runs cmd in the mirror, after an optional
 // setup step.
 //
-// Setup runs before the command rather than being folded into it so that a
-// failing `bundle install` reports itself, instead of surfacing as a confusing
+// The whole thing runs through a login shell. ssh without a tty starts a
+// non-login shell, so ~/.profile never runs and PATH is only what sshd
+// provided — tools managed by a version manager, or installed under
+// ~/.local/bin, are simply not found. Setup is the first thing that would fail,
+// with "bundle: not found", which reads as a broken host rather than a missing
+// environment.
+//
+// Setup runs before the command rather than being folded into it, so a failing
+// `bundle install` reports itself instead of surfacing later as a confusing
 // error from the test suite.
 func RunScript(remotePath, setup string, cmd []string) string {
-	var b strings.Builder
+	var inner strings.Builder
+
 	// QuotePath, not Quote: the mirror path carries the host's ~.
-	fmt.Fprintf(&b, "cd %s || exit 1\n", remote.QuotePath(remotePath))
+	fmt.Fprintf(&inner, "cd %s || exit 1\n", remote.QuotePath(remotePath))
 	if setup != "" {
-		fmt.Fprintf(&b, "%s || exit $?\n", setup)
+		fmt.Fprintf(&inner, "%s || exit $?\n", setup)
 	}
 	// exec so the command owns the exit status and signals directly.
-	fmt.Fprintf(&b, "exec %s", remote.QuoteAll(cmd))
-	return b.String()
+	fmt.Fprintf(&inner, "exec %s", remote.QuoteAll(cmd))
+
+	return "${SHELL:-/bin/sh} -lc " + remote.Quote(inner.String())
 }
