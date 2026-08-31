@@ -212,7 +212,7 @@ func cmdRun(args []string) error {
 	prep := session.EnsureRepoScript(dir, cloneURL)
 
 	if o.detach {
-		script := joinScripts(prep, session.CreateScript(name, dir, cmd))
+		script := joinScripts(prep, session.CreateScript(name, dir, cmd), session.StatusScript(name, host.Name))
 		if out, err := runCapture(host, script); err != nil {
 			return fmt.Errorf("%s: %s", host.Name, err)
 		} else if s := strings.TrimSpace(out); s != "" {
@@ -223,7 +223,15 @@ func cmdRun(args []string) error {
 		return nil
 	}
 
-	return attachTo(host, joinScripts(prep, session.CreateOrAttachScript(name, dir, cmd)))
+	// Say where this is going before handing over the terminal. tmux clears the
+	// screen on attach, so this scrolls away — the status bar is what persists —
+	// but it is what the user sees if the session fails to start at all.
+	fmt.Fprintf(os.Stderr, "→ %s  %s\n", host.Name, dir)
+
+	return attachTo(host, joinScripts(prep,
+		session.CreateScript(name, dir, cmd),
+		session.StatusScript(name, host.Name),
+		session.AttachScript(name)))
 }
 
 func joinScripts(parts ...string) string {

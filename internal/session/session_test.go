@@ -199,3 +199,18 @@ func TestCreateScriptFailsFast(t *testing.T) {
 		t.Error("create script should abort on failure")
 	}
 }
+
+func TestStatusScriptUsesInventoryNameNotTmuxHostname(t *testing.T) {
+	got := StatusScript("on-claude", "ol-agents")
+	// #H would report the machine's hostname, which is identical for two users
+	// on one box — exactly the distinction the inventory name preserves.
+	if strings.Contains(got, "#H") {
+		t.Errorf("should not use tmux's hostname: %q", got)
+	}
+	if !strings.Contains(got, "[ol-agents]") {
+		t.Errorf("status should name the inventory host: %q", got)
+	}
+	if !strings.Contains(got, "|| true") {
+		t.Errorf("a status bar is not worth failing a launch over: %q", got)
+	}
+}

@@ -110,6 +110,21 @@ devbox         devbox                  4   11929M   15887M    0.05  75% free
 testbox        testbox                 4   10464M   15615M    0.69  67% free
 ```
 
+## Knowing where you are
+
+With `--repo` the host is chosen for you, so `on` prints the target before
+attaching and labels the tmux status bar:
+
+```
+→ ol-agents  ~/projects/engineering
+[ol-agents] on-offerlab-claude
+```
+
+The label is the inventory name, not tmux's `#H`: one machine reached as two
+users is two environments, and `#H` reports the same hostname for both.
+
+`on ps` lists every session with its host.
+
 ## Behaviour worth knowing
 
 **Re-running reattaches.** `on builder claude` twice gets you back to the same

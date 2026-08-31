@@ -19,6 +19,22 @@ import (
 // whatever else the user runs on the host.
 const Prefix = "on-"
 
+// StatusScript labels the session's status bar with the host it is running on.
+//
+// With automatic placement the host is chosen for you, so without this there is
+// nothing on screen saying where you are. It uses the inventory name rather than
+// tmux's #H, because one machine reached as two users is two environments: #H
+// would report the same hostname for both and hide the distinction that matters.
+//
+// Scoped to this session, so the host's own tmux configuration is left alone,
+// and tolerant of failure since a status bar is not worth failing a launch over.
+func StatusScript(name, label string) string {
+	return fmt.Sprintf(
+		"tmux set-option -t %s status-left %s 2>/dev/null || true\n"+
+			"tmux set-option -t %s status-left-length 40 2>/dev/null || true",
+		remote.Quote(name), remote.Quote("["+label+"] #S "), remote.Quote(name))
+}
+
 // Name derives a tmux session name from a command.
 //
 // tmux treats "." and ":" as address separators, so they cannot appear in a
