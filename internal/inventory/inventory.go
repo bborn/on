@@ -34,8 +34,12 @@ type Host struct {
 	// Capabilities are free-form tags a caller can require, e.g. "postgres".
 	Capabilities []string `yaml:"capabilities"`
 
-	// Projects names repositories this host is provisioned to serve.
-	Projects []string `yaml:"projects"`
+	// Repos maps a project name to its checkout path on this host.
+	//
+	// Directory names are not project names: a checkout of offerlab may live at
+	// ~/projects/engineering on one host and ~/Projects/offerlab on another, so
+	// the mapping has to be explicit rather than inferred from the path.
+	Repos map[string]string `yaml:"repos"`
 }
 
 // DefaultWorkdir is used when a host does not set one.
@@ -44,6 +48,10 @@ const DefaultWorkdir = "~/worktrees"
 // Inventory is the parsed host file.
 type Inventory struct {
 	Hosts map[string]Host `yaml:"hosts"`
+
+	// Repos maps a project name to a clone URL, used when a host is asked for a
+	// project it does not have yet.
+	Repos map[string]string `yaml:"repos"`
 }
 
 // Has reports whether the host declares the named capability.
@@ -56,14 +64,47 @@ func (h Host) Has(capability string) bool {
 	return false
 }
 
-// Serves reports whether the host is provisioned for the named project.
+// Serves reports whether the host has a checkout of the named project.
 func (h Host) Serves(project string) bool {
-	for _, p := range h.Projects {
-		if p == project {
-			return true
+	_, ok := h.Repos[project]
+	return ok
+}
+
+// RepoPath returns the project's checkout path on this host, or "" if absent.
+func (h Host) RepoPath(project string) string { return h.Repos[project] }
+
+// HostsFor returns hosts that have a checkout of the project, in stable order.
+func (inv *Inventory) HostsFor(project string) []Host {
+	var out []Host
+	for _, n := range inv.Names() {
+		if h := inv.Hosts[n]; h.Serves(project) {
+			out = append(out, h)
 		}
 	}
-	return false
+	return out
+}
+
+// CloneURL returns the clone URL for a project, or "" if none is configured.
+func (inv *Inventory) CloneURL(project string) string { return inv.Repos[project] }
+
+// ProjectNames lists every project any host serves, for error messages and
+// completion.
+func (inv *Inventory) ProjectNames() []string {
+	seen := map[string]bool{}
+	for _, h := range inv.Hosts {
+		for p := range h.Repos {
+			seen[p] = true
+		}
+	}
+	for p := range inv.Repos {
+		seen[p] = true
+	}
+	names := make([]string, 0, len(seen))
+	for p := range seen {
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // DefaultPath is the inventory location, honouring ON_HOSTS for tests and
@@ -152,5 +193,10 @@ hosts:
   #   ssh: example              # must exist in ~/.ssh/config
   #   workdir: ~/worktrees      # where sessions and worktrees are rooted
   #   capabilities: [agent, ruby, node]
-  #   projects: [myapp]
+  #   repos:                    # project name -> checkout path on THIS host
+  #     myapp: ~/projects/myapp
+
+# Clone URLs, used when a host is asked for a project it does not have yet.
+# repos:
+#   myapp: git@github.com:me/myapp.git
 `

@@ -23,11 +23,13 @@ hosts:
     ssh: builder
     workdir: ~/worktrees
     capabilities: [agent, ruby]
-    projects: [myapp]
+    repos:
+      myapp: ~/projects/engineering
   testbox:
     ssh: testbox
     capabilities: [agent, postgres]
-    projects: [otherapp]
+    repos:
+      otherapp: ~/projects/otherapp
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +46,11 @@ hosts:
 		t.Errorf("capability lookup wrong: %+v", h.Capabilities)
 	}
 	if !h.Serves("myapp") || h.Serves("otherapp") {
-		t.Errorf("project lookup wrong: %+v", h.Projects)
+		t.Errorf("project lookup wrong: %+v", h.Repos)
+	}
+	// The directory name is not the project name; the mapping must be explicit.
+	if got := h.RepoPath("myapp"); got != "~/projects/engineering" {
+		t.Errorf("RepoPath = %q, want the configured path", got)
 	}
 
 	// A host that omits workdir still needs one to root sessions in.
@@ -139,5 +145,46 @@ func TestDefaultPathHonoursXDGConfigHome(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", "/xdg")
 	if got, want := DefaultPath(), "/xdg/on/hosts.yaml"; got != want {
 		t.Errorf("DefaultPath() = %q, want %q", got, want)
+	}
+}
+
+func TestHostsForAndCloneURL(t *testing.T) {
+	inv, err := Load(write(t, `
+repos:
+  shared: git@example.com:me/shared.git
+hosts:
+  a:
+    ssh: a
+    repos:
+      shared: ~/a/shared
+  b:
+    ssh: b
+    repos:
+      shared: ~/b/shared
+      only-b: ~/b/only
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := inv.HostsFor("shared"); len(got) != 2 {
+		t.Errorf("both hosts serve shared, got %d", len(got))
+	}
+	if got := inv.HostsFor("only-b"); len(got) != 1 || got[0].Name != "b" {
+		t.Errorf("only-b should resolve to host b, got %+v", got)
+	}
+	if got := inv.HostsFor("nope"); len(got) != 0 {
+		t.Errorf("unknown project should match no hosts, got %+v", got)
+	}
+	if got := inv.CloneURL("shared"); got != "git@example.com:me/shared.git" {
+		t.Errorf("CloneURL = %q", got)
+	}
+	if got := inv.CloneURL("only-b"); got != "" {
+		t.Errorf("a project with no clone URL should return empty, got %q", got)
+	}
+
+	names := inv.ProjectNames()
+	if len(names) != 2 || names[0] != "only-b" || names[1] != "shared" {
+		t.Errorf("ProjectNames = %v, want sorted [only-b shared]", names)
 	}
 }

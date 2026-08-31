@@ -33,15 +33,17 @@ usage:
   on kill <host> <name>            end a session
   on init                          write a starter inventory
 
-flags (before <host>):
+flags (before or just after <host>):
   -C <dir>      remote working directory
+  -r, --repo    project name; resolves to its checkout on the host
   -n <name>     session name (default: derived from the command)
   -d            create the session but do not attach
   --new         always start a new session instead of reattaching
 
 examples:
   on builder claude
-  on -C ~/projects/myapp devbox claude --resume
+  on --repo myapp claude              pick a host serving myapp, cd into it
+  on builder --repo myapp claude      that project, on that host
   on -d testbox bin/rails test
 
 Re-running the same command reattaches to the existing session rather than
@@ -91,15 +93,30 @@ func run(args []string) error {
 // `on devbox claude --resume` must send --resume to claude, not to on.
 type opts struct {
 	dir    string
+	repo   string
 	name   string
 	detach bool
 	fresh  bool
 }
 
+// parseFlags consumes leading flags and returns the remainder.
+//
+// It is called twice: once before the host, and once again just after it, so
+// both `on -r myapp builder claude` and `on builder -r myapp claude` work. The
+// second call stops at the first non-flag, which is where the remote command
+// begins — everything from there passes through untouched, so
+// `on builder claude --resume` sends --resume to claude.
+//
+// A literal "--" ends flag parsing, for the rare remote command that itself
+// starts with something flag-shaped.
 func parseFlags(args []string) (opts, []string, error) {
 	var o opts
 	i := 0
 	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		if args[i] == "--" {
+			i++
+			break
+		}
 		switch args[i] {
 		case "-C":
 			if i+1 >= len(args) {
@@ -113,6 +130,12 @@ func parseFlags(args []string) (opts, []string, error) {
 			}
 			o.name = args[i+1]
 			i += 2
+		case "--repo", "-r":
+			if i+1 >= len(args) {
+				return o, nil, fmt.Errorf("--repo needs a project name")
+			}
+			o.repo = args[i+1]
+			i += 2
 		case "-d":
 			o.detach = true
 			i++
@@ -120,7 +143,7 @@ func parseFlags(args []string) (opts, []string, error) {
 			o.fresh = true
 			i++
 		default:
-			return o, nil, fmt.Errorf("unknown flag %q (flags must come before the host)", args[i])
+			return o, nil, fmt.Errorf("unknown flag %q (flags go before or just after the host)", args[i])
 		}
 	}
 	return o, args[i:], nil
@@ -131,45 +154,142 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(rest) == 0 {
-		return fmt.Errorf("no host given\n\n%s", usage)
-	}
-	hostName, cmd := rest[0], rest[1:]
-
-	host, err := lookup(hostName)
+	inv, err := load()
 	if err != nil {
 		return err
 	}
+
+	// With --repo the host becomes optional, so the first argument counts as a
+	// host only when it actually names one. Otherwise it belongs to the command:
+	// `on --repo myapp claude` must not read "claude" as a host.
+	var host inventory.Host
+	cmd := rest
+	if len(rest) > 0 {
+		if h, ok := inv.Hosts[rest[0]]; ok {
+			host, cmd = h, rest[1:]
+
+			// Flags may also follow the host, so `on builder --repo myapp claude`
+			// works as documented. Merge them over what came before.
+			after, remainder, ferr := parseFlags(cmd)
+			if ferr != nil {
+				return ferr
+			}
+			o, cmd = merge(o, after), remainder
+		}
+	}
+	if host.Name == "" {
+		if o.repo == "" {
+			if len(rest) == 0 {
+				return fmt.Errorf("no host given\n\n%s", usage)
+			}
+			_, err := inv.Lookup(rest[0])
+			return err
+		}
+		if host, err = pickHostFor(inv, o.repo); err != nil {
+			return err
+		}
+	}
 	if len(cmd) == 0 {
-		return fmt.Errorf("no command given — try `on %s claude`", hostName)
+		return fmt.Errorf("no command given — try `on %s claude`", host.Name)
+	}
+
+	dir, cloneURL, err := resolveDir(inv, host, o)
+	if err != nil {
+		return err
 	}
 
 	name := o.name
 	if name == "" {
-		name = session.Name(cmd)
+		// The project is part of the name, or `on --repo a claude` and
+		// `on --repo b claude` would share one session and silently reattach to
+		// each other's work.
+		name = session.NameFor(o.repo, cmd)
 	}
 	if o.fresh {
 		name = uniqueName(host, name)
 	}
 
-	dir := o.dir
-	if dir == "" {
-		dir = host.Workdir
-	}
+	prep := session.EnsureRepoScript(dir, cloneURL)
 
 	if o.detach {
-		script := session.CreateScript(name, dir, cmd)
+		script := joinScripts(prep, session.CreateScript(name, dir, cmd))
 		if out, err := runCapture(host, script); err != nil {
 			return fmt.Errorf("%s: %s", host.Name, err)
 		} else if s := strings.TrimSpace(out); s != "" {
 			fmt.Println(s)
 		}
-		fmt.Printf("%s started on %s — attach with `on attach %s %s`\n",
-			name, host.Name, host.Name, name)
+		fmt.Printf("%s started on %s (%s) — attach with `on attach %s %s`\n",
+			name, host.Name, dir, host.Name, name)
 		return nil
 	}
 
-	return attachTo(host, session.CreateOrAttachScript(name, dir, cmd))
+	return attachTo(host, joinScripts(prep, session.CreateOrAttachScript(name, dir, cmd)))
+}
+
+func joinScripts(parts ...string) string {
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+// resolveDir decides where the session runs, and whether a clone is needed
+// first. An explicit -C always wins over --repo.
+func resolveDir(inv *inventory.Inventory, host inventory.Host, o opts) (dir, cloneURL string, err error) {
+	if o.dir != "" {
+		return o.dir, "", nil
+	}
+	if o.repo == "" {
+		return host.Workdir, "", nil
+	}
+	if p := host.RepoPath(o.repo); p != "" {
+		return p, "", nil
+	}
+
+	// The host has no checkout. Cloning on demand is what keeps placement
+	// transparent — a host that has never seen the project behaves like one that
+	// has — but it needs a URL to clone from.
+	url := inv.CloneURL(o.repo)
+	if url == "" {
+		return "", "", fmt.Errorf(
+			"%s has no checkout of %q, and no clone URL is configured for it\n"+
+				"add it under the host's `repos:` or as a top-level `repos:` entry",
+			host.Name, o.repo)
+	}
+	return strings.TrimRight(host.Workdir, "/") + "/" + o.repo, url, nil
+}
+
+// pickHostFor chooses among the hosts that serve a project, preferring the one
+// with the most memory available — the whole point being to land work where
+// there is room for it.
+func pickHostFor(inv *inventory.Inventory, repo string) (inventory.Host, error) {
+	candidates := inv.HostsFor(repo)
+	if len(candidates) == 0 {
+		if inv.CloneURL(repo) != "" {
+			return inventory.Host{}, fmt.Errorf(
+				"no host has %q yet — name one to clone it there, e.g. `on <host> --repo %s claude`",
+				repo, repo)
+		}
+		return inventory.Host{}, fmt.Errorf("unknown project %q — inventory knows: %s",
+			repo, strings.Join(inv.ProjectNames(), ", "))
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+
+	best, bestFree := inventory.Host{}, -1
+	for _, st := range fleet.Probe(candidates, false) {
+		if st.Reachable && st.AvailMB > bestFree {
+			best, bestFree = st.Host, st.AvailMB
+		}
+	}
+	if bestFree < 0 {
+		return inventory.Host{}, fmt.Errorf("no reachable host serves %q", repo)
+	}
+	return best, nil
 }
 
 func cmdAttach(args []string) error {
@@ -526,3 +646,25 @@ _on_complete() {
 }
 complete -F _on_complete on
 `
+
+// merge overlays flags parsed after the host onto those parsed before it. A flag
+// given in either position wins over the zero value; giving it twice is harmless
+// and the later one applies.
+func merge(before, after opts) opts {
+	if after.dir != "" {
+		before.dir = after.dir
+	}
+	if after.repo != "" {
+		before.repo = after.repo
+	}
+	if after.name != "" {
+		before.name = after.name
+	}
+	if after.detach {
+		before.detach = true
+	}
+	if after.fresh {
+		before.fresh = true
+	}
+	return before
+}

@@ -35,17 +35,28 @@ on init          # writes ~/.config/on/hosts.yaml
 
 ```yaml
 hosts:
+# Clone URLs, used when a host is asked for a project it does not have yet.
+repos:
+  myapp: git@github.com:me/myapp.git
+
+hosts:
   builder:
     ssh: builder              # an ssh_config alias — NOT a hostname
     workdir: ~/projects
     capabilities: [agent, ruby, node]
-    projects: [myapp]
+    repos:                    # project name -> checkout path on THIS host
+      myapp: ~/projects/engineering
 
   testbox:
     ssh: testbox
     capabilities: [agent, ruby, node, postgres, redis]
-    projects: [myapp]
+    repos:
+      myapp: ~/src/myapp
 ```
+
+Note that `repos` maps a **project name to a path**, because directory names are
+not project names — the same project is often checked out as `engineering` on one
+host and `myapp` on another. Keying on the path would make placement guesswork.
 
 `ssh:` names an **ssh_config alias**, never a hostname or IP. The alias already
 carries the user, the identity file and any connection tuning — and it is the only
@@ -60,6 +71,7 @@ It also keeps private addresses out of the file.
 
 ```
 on [flags] <host> <command>...   run in a tmux session there, and attach
+on --repo <project> <command>... pick a host serving the project, and run there
 on ls                            fleet health: cores, free memory, load
 on ps                            live sessions across the fleet
 on attach <host> [name]          reattach
@@ -68,13 +80,27 @@ on init                          write a starter inventory
 
 flags (before the host):
   -C <dir>    remote working directory
+  -r, --repo  project name; resolves to its checkout on the host
   -n <name>   session name (default: derived from the command)
   -d          create but do not attach
   --new       always start a new session instead of reattaching
 ```
 
-Flags come **before** the host so everything after it passes through untouched:
-`on devbox claude --resume` sends `--resume` to claude, not to `on`.
+Flags go before or just after the host; everything from the first non-flag
+onward is the remote command, so `on devbox claude --resume` sends `--resume` to
+claude rather than to `on`.
+
+## Projects
+
+```
+on --repo myapp claude          # picks the host with the most free memory
+on builder --repo myapp claude  # that project, on that host
+```
+
+If the chosen host has no checkout, `on` clones it from the top-level `repos:`
+URL, so a host that has never seen the project behaves like one that has. When
+several hosts serve a project, the one with the most memory available wins —
+landing work where there is room for it is the entire point.
 
 ```
 $ on ls

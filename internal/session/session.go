@@ -36,6 +36,15 @@ func Name(cmd []string) string {
 	return Prefix + sanitize(base)
 }
 
+// NameFor derives a session name that also distinguishes the project, so two
+// repos running the same command do not collide on one session.
+func NameFor(repo string, cmd []string) string {
+	if repo == "" {
+		return Name(cmd)
+	}
+	return Prefix + sanitize(repo) + "-" + strings.TrimPrefix(Name(cmd), Prefix)
+}
+
 func sanitize(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -71,6 +80,20 @@ func CreateOrAttachScript(name, dir string, cmd []string) string {
 // if it already exists.
 func CreateScript(name, dir string, cmd []string) string {
 	return createScript(name, dir, cmd)
+}
+
+// EnsureRepoScript clones url into dir if there is no checkout there yet.
+//
+// Cloning on demand is what makes `on --repo x claude` transparent: a host that
+// has never seen the project behaves the same as one that has. The guard checks
+// for .git rather than the directory, so a stale empty directory does not make
+// the project look present.
+func EnsureRepoScript(dir, url string) string {
+	if url == "" {
+		return ""
+	}
+	return fmt.Sprintf("[ -d %s/.git ] || git clone %s %s",
+		remote.QuotePath(dir), remote.Quote(url), remote.QuotePath(dir))
 }
 
 func createScript(name, dir string, cmd []string) string {
