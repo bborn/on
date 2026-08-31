@@ -25,14 +25,14 @@ printf '%s\t%s\t%s\t%s\n' "$c" "$t" "$a" "$l"`
 
 // Status is one host's probe result.
 type Status struct {
-	Host     inventory.Host
+	Host      inventory.Host
 	Reachable bool
-	Err      string
+	Err       string
 
-	Cores    int
-	TotalMB  int
-	AvailMB  int
-	Load     float64
+	Cores   int
+	TotalMB int
+	AvailMB int
+	Load    float64
 
 	Sessions []session.Info
 }

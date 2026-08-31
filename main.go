@@ -1,6 +1,6 @@
 // Command on runs work on a remote host and hands you the terminal.
 //
-//	on ol-agents claude            start or reattach an agent session there
+//	on builder claude            start or reattach an agent session there
 //	on ls                          fleet health
 //	on ps                          live sessions across the fleet
 //
@@ -40,9 +40,9 @@ flags (before <host>):
   --new         always start a new session instead of reattaching
 
 examples:
-  on ol-agents claude
-  on -C ~/projects/offerlab mona claude --resume
-  on -d ik-agents bin/rails test
+  on builder claude
+  on -C ~/projects/myapp devbox claude --resume
+  on -d testbox bin/rails test
 
 Re-running the same command reattaches to the existing session rather than
 starting a second one. Sessions survive disconnection; reattach from anywhere.
@@ -72,13 +72,23 @@ func run(args []string) error {
 		return cmdAttach(args[1:])
 	case "kill":
 		return cmdKill(args[1:])
+	case "completion":
+		return cmdCompletion(args[1:])
+
+	// Hidden helpers for shell completion. These read the inventory locally and
+	// never probe the network, because a completion that pauses to open ssh
+	// connections is worse than no completion at all.
+	case "_hosts":
+		return cmdListHostNames()
+	case "_sessions":
+		return cmdListSessionNames(args[1:])
 	}
 	return cmdRun(args)
 }
 
 // opts are the flags accepted before the host name. Flags must precede the host
 // so that everything after it passes through to the remote command untouched —
-// `on mona claude --resume` must send --resume to claude, not to on.
+// `on devbox claude --resume` must send --resume to claude, not to on.
 type opts struct {
 	dir    string
 	name   string
@@ -361,3 +371,158 @@ func allHosts(inv *inventory.Inventory) []inventory.Host {
 	}
 	return hosts
 }
+
+func cmdListHostNames() error {
+	inv, err := load()
+	if err != nil {
+		return err
+	}
+	for _, n := range inv.Names() {
+		fmt.Println(n)
+	}
+	return nil
+}
+
+func cmdListSessionNames(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	host, err := lookup(args[0])
+	if err != nil {
+		return err
+	}
+	for _, s := range onSessions(host) {
+		fmt.Println(s.Name)
+	}
+	return nil
+}
+
+func cmdCompletion(args []string) error {
+	shell := ""
+	if len(args) > 0 {
+		shell = args[0]
+	}
+	switch shell {
+	case "zsh":
+		fmt.Print(zshCompletion)
+	case "bash":
+		fmt.Print(bashCompletion)
+	default:
+		return fmt.Errorf("usage: on completion <zsh|bash>\n\nzsh:  on completion zsh  > \"${fpath[1]}/_on\"\nbash: on completion bash > /usr/local/etc/bash_completion.d/on")
+	}
+	return nil
+}
+
+// Host names are completed from the local inventory only. Session names require
+// a round trip, so they are offered solely for `attach` and `kill`, where the
+// user has already committed to a specific host and a brief pause is expected.
+const zshCompletion = `#compdef on
+
+_on() {
+  local -a subcmds
+  subcmds=(
+    'ls:list hosts with load and free memory'
+    'ps:list live sessions across the fleet'
+    'attach:reattach to a session'
+    'kill:end a session'
+    'init:write a starter inventory'
+    'completion:output a shell completion script'
+  )
+
+  local -a hosts
+  hosts=(${(f)"$(_call_program on-hosts on _hosts 2>/dev/null)"})
+
+  # Flags must precede the host, so offer them only before one is chosen.
+  local -a flags
+  flags=(
+    '-C[remote working directory]:directory:_files -/'
+    '-n[session name]:name:'
+    '-d[create but do not attach]'
+    '--new[always start a new session]'
+  )
+
+  case $words[2] in
+    attach|kill)
+      if (( CURRENT == 3 )); then
+        _describe 'host' hosts
+      elif (( CURRENT == 4 )); then
+        local -a sessions
+        sessions=(${(f)"$(_call_program on-sessions on _sessions $words[3] 2>/dev/null)"})
+        _describe 'session' sessions
+      fi
+      return
+      ;;
+    completion)
+      (( CURRENT == 3 )) && _values 'shell' zsh bash
+      return
+      ;;
+    ls|ps|init)
+      return
+      ;;
+  esac
+
+  # Find the host argument, skipping any flags and their values.
+  local -i i=2 hostpos=0
+  while (( i < CURRENT )); do
+    case $words[i] in
+      -C|-n) (( i += 2 )) ;;
+      -d|--new) (( i += 1 )) ;;
+      -*) (( i += 1 )) ;;
+      *) hostpos=$i; break ;;
+    esac
+  done
+
+  if (( hostpos == 0 )); then
+    _arguments -S $flags '*:host:->host' && return
+    _describe 'host' hosts
+    _describe 'command' subcmds
+    return
+  fi
+
+  # Past the host, everything belongs to the remote command. Local command names
+  # are an imperfect but useful proxy: the fleet largely runs the same tools.
+  if (( CURRENT == hostpos + 1 )); then
+    _command_names -e
+  else
+    _default
+  fi
+}
+
+_on "$@"
+`
+
+const bashCompletion = `# bash completion for on
+_on_complete() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=($(compgen -W "ls ps attach kill init completion $(on _hosts 2>/dev/null)" -- "$cur"))
+    return
+  fi
+
+  case "${COMP_WORDS[1]}" in
+    attach|kill)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=($(compgen -W "$(on _hosts 2>/dev/null)" -- "$cur"))
+      elif [ "$COMP_CWORD" -eq 3 ]; then
+        COMPREPLY=($(compgen -W "$(on _sessions "${COMP_WORDS[2]}" 2>/dev/null)" -- "$cur"))
+      fi
+      return
+      ;;
+    completion)
+      COMPREPLY=($(compgen -W "zsh bash" -- "$cur"))
+      return
+      ;;
+  esac
+
+  case "$prev" in
+    -C) COMPREPLY=($(compgen -d -- "$cur")); return ;;
+    -n) return ;;
+  esac
+
+  COMPREPLY=($(compgen -c -- "$cur"))
+}
+complete -F _on_complete on
+`

@@ -20,7 +20,8 @@ import (
 //
 // Single quotes suppress every form of expansion. The only character that cannot
 // appear inside them is a single quote, which is emitted by closing the string,
-// escaping the quote, and reopening: 'it'\''s'.
+// escaping the quote with a backslash, and reopening. See the test for the
+// exact forms, which are round-tripped through a real shell.
 func Quote(s string) string {
 	if s == "" {
 		return "''"
@@ -29,6 +30,29 @@ func Quote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// QuotePath quotes a path while still letting a leading ~ expand on the remote
+// host.
+//
+// Quote deliberately protects "~" along with every other expansion character, so
+// a config value of "~/projects" would reach the remote as a literal directory
+// named "~/projects" — which does not exist. Paths are the one case where that
+// expansion is wanted, since inventories and command lines are written with "~"
+// and the home directory differs per host and per user.
+//
+// Only a leading "~/" (or a bare "~") is treated as home; "~user" is not
+// supported, and a tilde anywhere else stays literal.
+func QuotePath(p string) string {
+	if p == "~" {
+		return `"$HOME"`
+	}
+	if rest, ok := strings.CutPrefix(p, "~/"); ok {
+		// "$HOME" is double-quoted so a home directory containing spaces
+		// survives; the remainder is quoted normally and concatenated.
+		return `"$HOME"/` + Quote(rest)
+	}
+	return Quote(p)
 }
 
 // QuoteAll joins args into one shell-safe command string.

@@ -54,8 +54,8 @@ func TestCreateOrAttachIsIdempotent(t *testing.T) {
 }
 
 func TestCreateScriptQuotesDirAndCommand(t *testing.T) {
-	got := CreateScript("on-claude", "/home/b/my projects", []string{"claude", "--flag", "a b"})
-	if !strings.Contains(got, `-c '/home/b/my projects'`) {
+	got := CreateScript("on-claude", "/home/user/my projects", []string{"claude", "--flag", "a b"})
+	if !strings.Contains(got, `-c '/home/user/my projects'`) {
 		t.Errorf("directory not quoted: %q", got)
 	}
 	// The command reaches tmux as one argument, so it is quoted twice: once to
@@ -109,5 +109,24 @@ func TestParseListHandlesEmptyAndMalformed(t *testing.T) {
 	}
 	if got := ParseList("garbage\nalso garbage\n"); len(got) != 0 {
 		t.Errorf("malformed rows should be skipped, got %v", got)
+	}
+}
+
+func TestCreateScriptExpandsTildeWorkdir(t *testing.T) {
+	got := CreateScript("on-claude", "~/projects", []string{"claude"})
+	// A quoted tilde would make tmux look for a literal "~/projects" directory.
+	if strings.Contains(got, `-c '~/projects'`) {
+		t.Errorf("tilde must not be quoted literally: %q", got)
+	}
+	if !strings.Contains(got, `-c "$HOME"/projects`) {
+		t.Errorf("tilde should expand on the remote host: %q", got)
+	}
+}
+
+func TestCreateScriptFailsFast(t *testing.T) {
+	// Without set -e a failed new-session fell through to the attach, which
+	// reported "can't find session" and hid the real cause.
+	if !strings.HasPrefix(CreateScript("n", "/w", []string{"x"}), "set -e\n") {
+		t.Error("create script should abort on failure")
 	}
 }

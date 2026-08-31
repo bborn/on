@@ -19,42 +19,43 @@ func write(t *testing.T, content string) string {
 func TestLoad(t *testing.T) {
 	inv, err := Load(write(t, `
 hosts:
-  ol-agents:
-    ssh: ol-agents
+  builder:
+    ssh: builder
     workdir: ~/worktrees
     capabilities: [agent, ruby]
-    projects: [offerlab]
-  ik-agents:
-    ssh: ik-agents
+    projects: [myapp]
+  testbox:
+    ssh: testbox
     capabilities: [agent, postgres]
+    projects: [otherapp]
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	h, err := inv.Lookup("ol-agents")
+	h, err := inv.Lookup("builder")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.SSH != "ol-agents" || h.Name != "ol-agents" {
+	if h.SSH != "builder" || h.Name != "builder" {
 		t.Errorf("unexpected host: %+v", h)
 	}
 	if !h.Has("ruby") || h.Has("postgres") {
 		t.Errorf("capability lookup wrong: %+v", h.Capabilities)
 	}
-	if !h.Serves("offerlab") || h.Serves("influencekit") {
+	if !h.Serves("myapp") || h.Serves("otherapp") {
 		t.Errorf("project lookup wrong: %+v", h.Projects)
 	}
 
 	// A host that omits workdir still needs one to root sessions in.
-	ik, _ := inv.Lookup("ik-agents")
+	ik, _ := inv.Lookup("testbox")
 	if ik.Workdir != DefaultWorkdir {
 		t.Errorf("workdir should default to %q, got %q", DefaultWorkdir, ik.Workdir)
 	}
 }
 
 func TestLookupUnknownHostNamesTheAlternatives(t *testing.T) {
-	inv, err := Load(write(t, "hosts:\n  rex:\n    ssh: rex\n  mona:\n    ssh: mona\n"))
+	inv, err := Load(write(t, "hosts:\n  bigbox:\n    ssh: bigbox\n  devbox:\n    ssh: devbox\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestLookupUnknownHostNamesTheAlternatives(t *testing.T) {
 	}
 	// A mistyped host is the most common failure; the error should be actionable
 	// rather than sending the user to read the config.
-	if !strings.Contains(err.Error(), "mona") || !strings.Contains(err.Error(), "rex") {
+	if !strings.Contains(err.Error(), "devbox") || !strings.Contains(err.Error(), "bigbox") {
 		t.Errorf("error should list available hosts, got: %v", err)
 	}
 }

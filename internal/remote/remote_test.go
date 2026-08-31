@@ -54,25 +54,25 @@ func TestQuoteRoundTripsThroughShell(t *testing.T) {
 }
 
 func TestCommandBuildsExpectedArgv(t *testing.T) {
-	got := Command("ol-agents", Options{}, []string{"claude"})
-	want := []string{"ssh", "-o", "ConnectTimeout=10", "ol-agents", "--", "claude"}
+	got := Command("builder", Options{}, []string{"claude"})
+	want := []string{"ssh", "-o", "ConnectTimeout=10", "builder", "--", "claude"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
 func TestCommandTTYUsesForcedAllocation(t *testing.T) {
-	got := Command("rex", Options{TTY: true}, []string{"tmux", "attach"})
+	got := Command("bigbox", Options{TTY: true}, []string{"tmux", "attach"})
 	if !contains(got, "-tt") {
 		t.Errorf("TTY option should force allocation with -tt, got %v", got)
 	}
 }
 
 func TestCommandWithDirCdsAndExecs(t *testing.T) {
-	got := Command("mona", Options{Dir: "/home/bruno/projects/my app"}, []string{"rails", "test"})
+	got := Command("devbox", Options{Dir: "/home/user/projects/my app"}, []string{"rails", "test"})
 	remote := got[len(got)-1]
 
-	if !strings.HasPrefix(remote, "cd '/home/bruno/projects/my app' && exec ") {
+	if !strings.HasPrefix(remote, "cd '/home/user/projects/my app' && exec ") {
 		t.Errorf("expected quoted cd then exec, got %q", remote)
 	}
 	// exec matters: without it the wrapper shell owns the exit status and signals.
@@ -96,7 +96,7 @@ func TestIsConnectionFailure(t *testing.T) {
 		stderr string
 		want   bool
 	}{
-		{"ssh could not connect", 255, "ssh: connect to host rex port 22: Connection refused", true},
+		{"ssh could not connect", 255, "ssh: connect to host bigbox port 22: Connection refused", true},
 		{"unresolvable host", 255, "ssh: Could not resolve hostname nope", true},
 		{"remote command legitimately exited 255", 255, "my program failed\n", false},
 		{"ordinary command failure", 1, "boom", false},
@@ -119,4 +119,44 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func TestQuotePathExpandsLeadingTilde(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// Regression: Quote() protects ~ like any other expansion character, so a
+		// workdir of ~/projects reached tmux as a literal directory of that name,
+		// the session was never created, and the attach reported the misleading
+		// "can't find session".
+		{"leading tilde expands", "~/projects", `"$HOME"/projects`},
+		{"bare tilde", "~", `"$HOME"`},
+		{"tilde path with a space", "~/my projects", `"$HOME"/'my projects'`},
+		{"absolute path is unaffected", "/home/user/x", "/home/user/x"},
+		{"absolute path with space still quoted", "/home/user/my x", "'/home/user/my x'"},
+		{"tilde not at the start stays literal", "/a/~/b", "'/a/~/b'"},
+		{"~user is not supported and stays literal", "~deploy/x", "'~deploy/x'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := QuotePath(tt.in); got != tt.want {
+				t.Errorf("QuotePath(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuotePathResolvesToRealHomeInShell(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh available")
+	}
+	out, err := exec.Command("sh", "-c", "HOME=/tmp/somehome; printf %s "+QuotePath("~/projects")).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(out), "/tmp/somehome/projects"; got != want {
+		t.Errorf("expanded to %q, want %q", got, want)
+	}
 }

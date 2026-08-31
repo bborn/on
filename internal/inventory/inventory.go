@@ -3,7 +3,8 @@
 // A host entry names an ssh_config alias rather than a hostname or IP. The alias
 // already carries the user, identity file and any connection tuning, and it is the
 // only representation that distinguishes two accounts on one machine — e.g. a box
-// reachable as both `rex` (root) and `ol-agents` (olgm), which have different
+// reachable as both `bigbox` (root) and `bigbox-dev` (an unprivileged account),
+// which have different
 // HOME, PATH, toolchains and credentials. It also keeps private addresses out of
 // this file.
 package inventory

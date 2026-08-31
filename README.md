@@ -3,10 +3,10 @@
 Run work on another machine, interactively.
 
 ```
-on ol-agents claude
+on builder claude
 ```
 
-That starts `claude` on `ol-agents` — its CPU, its RAM, its checkouts, its
+That starts `claude` on `builder` — its CPU, its RAM, its checkouts, its
 credentials — inside a tmux session, and hands you the terminal. Detach and it
 keeps running. Reattach from anywhere, including a phone.
 
@@ -35,22 +35,22 @@ on init          # writes ~/.config/on/hosts.yaml
 
 ```yaml
 hosts:
-  ol-agents:
-    ssh: ol-agents              # an ssh_config alias — NOT a hostname
+  builder:
+    ssh: builder              # an ssh_config alias — NOT a hostname
     workdir: ~/projects
     capabilities: [agent, ruby, node]
-    projects: [offerlab]
+    projects: [myapp]
 
-  ik-agents:
-    ssh: ik-agents
+  testbox:
+    ssh: testbox
     capabilities: [agent, ruby, node, postgres, redis]
-    projects: [influencekit]
+    projects: [myapp]
 ```
 
 `ssh:` names an **ssh_config alias**, never a hostname or IP. The alias already
 carries the user, the identity file and any connection tuning — and it is the only
 thing that distinguishes two accounts on one machine. A box reachable as both
-`rex` (root) and `ol-agents` (olgm) is two different environments: different
+`bigbox` (root) and `bigbox-dev` (an unprivileged account) is two different environments: different
 `HOME`, `PATH`, toolchain and credentials. Keying on the hostname would make
 "run it on that machine" ambiguous in a way that produces baffling failures.
 
@@ -74,19 +74,19 @@ flags (before the host):
 ```
 
 Flags come **before** the host so everything after it passes through untouched:
-`on mona claude --resume` sends `--resume` to claude, not to `on`.
+`on devbox claude --resume` sends `--resume` to claude, not to `on`.
 
 ```
 $ on ls
 HOST           SSH                 CORES    AVAIL    TOTAL    LOAD
-ik-agents      ik-agents               4   10464M   15615M    0.69  67% free
-mona           mona                    4   11929M   15887M    0.05  75% free
-ol-agents      ol-agents              16   24741M   31337M    0.28  78% free
+builder        builder                16   24741M   31337M    0.28  78% free
+devbox         devbox                  4   11929M   15887M    0.05  75% free
+testbox        testbox                 4   10464M   15615M    0.69  67% free
 ```
 
 ## Behaviour worth knowing
 
-**Re-running reattaches.** `on ol-agents claude` twice gets you back to the same
+**Re-running reattaches.** `on builder claude` twice gets you back to the same
 session rather than starting a second one, because that is almost always what you
 meant. Use `--new` for a genuinely separate session.
 

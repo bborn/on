@@ -76,13 +76,17 @@ func CreateScript(name, dir string, cmd []string) string {
 func createScript(name, dir string, cmd []string) string {
 	var b strings.Builder
 
+	// Abort if the session cannot be created, so the real error surfaces
+	// instead of a misleading "can't find session" from the attach that follows.
+	b.WriteString("set -e\n")
+
 	// has-session is the idempotency guard: creating a session that already
 	// exists is an error in tmux, and re-running `on` must not be an error.
 	fmt.Fprintf(&b, "tmux has-session -t %s 2>/dev/null || tmux new-session -d -s %s",
 		remote.Quote(name), remote.Quote(name))
 
 	if dir != "" {
-		fmt.Fprintf(&b, " -c %s", remote.Quote(dir))
+		fmt.Fprintf(&b, " -c %s", remote.QuotePath(dir))
 	}
 	if len(cmd) > 0 {
 		// tmux takes the command as a single shell-command argument, so the
