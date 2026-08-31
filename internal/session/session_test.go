@@ -1,8 +1,11 @@
 package session
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/bborn/on/internal/remote"
 )
 
 func TestName(t *testing.T) {
@@ -58,10 +61,14 @@ func TestCreateScriptQuotesDirAndCommand(t *testing.T) {
 	if !strings.Contains(got, `-c '/home/user/my projects'`) {
 		t.Errorf("directory not quoted: %q", got)
 	}
-	// The command reaches tmux as one argument, so it is quoted twice: once to
-	// build the command line, once to keep it a single word for tmux.
-	if !strings.Contains(got, `'claude --flag '\''a b'\'''`) {
-		t.Errorf("command not double-quoted for tmux: %q", got)
+	// The command reaches tmux as a single argument that runs a login shell, so
+	// it survives two levels of quoting. Assert structure here; the exact
+	// escaping is covered by the round-trip test below.
+	if !strings.Contains(got, "-lc") {
+		t.Errorf("command should run under a login shell: %q", got)
+	}
+	if !strings.Contains(got, "claude --flag") {
+		t.Errorf("command line missing: %q", got)
 	}
 }
 
@@ -70,8 +77,70 @@ func TestCreateScriptOmitsEmptyDirAndCommand(t *testing.T) {
 	if strings.Contains(got, " -c ") {
 		t.Errorf("empty dir should be omitted: %q", got)
 	}
-	if !strings.HasSuffix(got, "-s on-shell") {
+	if strings.Contains(got, "-lc") {
 		t.Errorf("empty command should be omitted: %q", got)
+	}
+}
+
+func TestLoginShellWrap(t *testing.T) {
+	// tmux starts commands in a non-login, non-interactive shell, so ~/.profile
+	// never runs and PATH is whatever sshd provided. Tools under ~/.local/bin or
+	// managed by a version manager are then "not found", which reads as a broken
+	// tool rather than a missing environment.
+	got := LoginShellWrap([]string{"claude", "--resume"})
+	if !strings.HasPrefix(got, "${SHELL:-/bin/sh} -lc ") {
+		t.Errorf("should invoke a login shell: %q", got)
+	}
+	if !strings.Contains(got, "'claude --resume'") {
+		t.Errorf("command should be one quoted argument: %q", got)
+	}
+}
+
+func TestCreateScriptDefersShellExpansionToTheRemote(t *testing.T) {
+	got := CreateScript("on-claude", "~/projects", []string{"claude"})
+	// ${SHELL} must reach the remote unexpanded; resolving it locally would pick
+	// the wrong host's login shell.
+	if !strings.Contains(got, "${SHELL:-/bin/sh}") {
+		t.Errorf("SHELL must be resolved remotely: %q", got)
+	}
+}
+
+func TestCreateScriptKeepsFailedPaneVisible(t *testing.T) {
+	got := CreateScript("on-claude", "", []string{"claude"})
+	// A command that fails instantly would otherwise take the session with it,
+	// leaving a vanished session and no error to read.
+	if !strings.Contains(got, "remain-on-exit failed") {
+		t.Errorf("a failed command should leave its error readable: %q", got)
+	}
+	// Older tmux rejects the "failed" value; that must not fail the whole run.
+	if !strings.Contains(got, "|| true") {
+		t.Errorf("remain-on-exit should tolerate older tmux: %q", got)
+	}
+}
+
+// The layered quoting is only correct if the command survives every hop, so
+// replay the path a real invocation takes: the ssh login shell strips one layer,
+// then tmux runs the result through sh -c.
+func TestCommandSurvivesQuotingLayersInRealShells(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh available")
+	}
+	tmuxArg := remote.Quote(LoginShellWrap([]string{"printf", "%s|%s", "a b", "it's"}))
+
+	// Layer 1: the shell running our script hands tmux exactly one argument.
+	out, err := exec.Command("sh", "-c", "printf %s "+tmuxArg).Output()
+	if err != nil {
+		t.Fatalf("layer 1 rejected the argument: %v", err)
+	}
+
+	// Layer 2: tmux runs that string via sh -c. SHELL is pinned so the test does
+	// not depend on the developer's own login shell.
+	out, err = exec.Command("sh", "-c", "SHELL=/bin/sh; "+string(out)).Output()
+	if err != nil {
+		t.Fatalf("layer 2 rejected the command: %v", err)
+	}
+	if got, want := string(out), "a b|it's"; got != want {
+		t.Errorf("arguments did not survive quoting: got %q, want %q", got, want)
 	}
 }
 

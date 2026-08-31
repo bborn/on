@@ -91,9 +91,32 @@ func createScript(name, dir string, cmd []string) string {
 	if len(cmd) > 0 {
 		// tmux takes the command as a single shell-command argument, so the
 		// already-quoted command line is quoted once more to survive as one word.
-		fmt.Fprintf(&b, " %s", remote.Quote(remote.QuoteAll(cmd)))
+		fmt.Fprintf(&b, " %s", remote.Quote(LoginShellWrap(cmd)))
 	}
+
+	// Keep a pane that failed, so its error is readable instead of vanishing
+	// with the session. Older tmux has no "failed" value, hence the fallback.
+	fmt.Fprintf(&b, "\ntmux set-option -t %s remain-on-exit failed 2>/dev/null || true",
+		remote.Quote(name))
+
 	return b.String()
+}
+
+// LoginShellWrap runs cmd through the remote user's login shell.
+//
+// tmux starts commands in a non-login, non-interactive shell, so none of
+// ~/.profile, ~/.bash_profile or ~/.zprofile runs and PATH is whatever the ssh
+// daemon happened to provide. Tools installed under ~/.local/bin, or managed by
+// a version manager like mise, are then simply "not found" — the failure looks
+// like a broken tool rather than a missing environment.
+//
+// Running through a login shell makes `on <host> claude` behave the way the user
+// expects: as if they had logged into that host and typed the command.
+//
+// The result is left unquoted here so that ${SHELL} is expanded by the shell tmux
+// uses to run it; the caller quotes the whole string to keep it a single word.
+func LoginShellWrap(cmd []string) string {
+	return "${SHELL:-/bin/sh} -lc " + remote.Quote(remote.QuoteAll(cmd))
 }
 
 // AttachScript attaches to an existing session, failing if it is absent.
