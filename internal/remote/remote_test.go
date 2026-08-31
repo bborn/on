@@ -160,3 +160,16 @@ func TestQuotePathResolvesToRealHomeInShell(t *testing.T) {
 		t.Errorf("expanded to %q, want %q", got, want)
 	}
 }
+
+func TestCommandExpandsTildeInWorkingDirectory(t *testing.T) {
+	// Latent sibling of the mirror and session bugs: Options.Dir is a path, so
+	// it needs QuotePath rather than Quote.
+	got := Command("h", Options{Dir: "~/projects/app"}, []string{"ls"})
+	remoteCmd := got[len(got)-1]
+	if strings.Contains(remoteCmd, "cd '~/projects") {
+		t.Errorf("tilde must not be quoted literally: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, `cd "$HOME"/projects/app`) {
+		t.Errorf("tilde should expand on the remote: %q", remoteCmd)
+	}
+}

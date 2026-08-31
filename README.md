@@ -110,6 +110,42 @@ devbox         devbox                  4   11929M   15887M    0.05  75% free
 testbox        testbox                 4   10464M   15615M    0.69  67% free
 ```
 
+## Running a command against uncommitted work
+
+```
+cd ~/code/myapp
+on exec bin/rails test
+```
+
+`on exec` rsyncs the current directory to a host, runs the command there, streams
+output back, and exits with the remote command's status — so a failing suite
+fails your shell exactly as a local run would. The project is detected from the
+checkout's git remote, so usually no arguments are needed.
+
+This is the case where the work is **uncommitted**: an agent has just edited
+files and wants tests run somewhere with spare CPU. Committing first is not an
+option, and a network filesystem is far too slow for a test suite.
+
+What crosses is governed by `.gitignore`, including nested ones. A hand-written
+exclude list cannot keep up with a working tree — the first real run of this
+copied 623MB of compiled binaries and git history before the filter existed.
+`.git` is skipped by default too. Native dependencies are deliberately left
+behind: a macOS arm64 gem will not run on a Linux x86 host, so the remote builds
+its own via a `setup` step:
+
+```yaml
+exec:
+  myapp:
+    setup: bundle install --quiet
+    exclude: [storage/]
+```
+
+Keep `setup` cheap and idempotent — it runs on every invocation.
+
+Point an agent at it from `CLAUDE.md` or `AGENTS.md`:
+
+> Run tests with `on exec bin/rails test`, never `bin/rails test`.
+
 ## Knowing where you are
 
 With `--repo` the host is chosen for you, so `on` prints the target before

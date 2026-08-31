@@ -52,6 +52,34 @@ type Inventory struct {
 	// Repos maps a project name to a clone URL, used when a host is asked for a
 	// project it does not have yet.
 	Repos map[string]string `yaml:"repos"`
+
+	// Exec holds per-project settings for `on exec`.
+	Exec map[string]ExecConfig `yaml:"exec"`
+}
+
+// ExecConfig is how a project prepares itself on a remote host.
+type ExecConfig struct {
+	// Setup runs in the mirror before the command. It must be cheap and
+	// idempotent, since it runs on every invocation — `bundle install` is the
+	// intended shape: near-instant once satisfied.
+	//
+	// It exists because dependencies are deliberately not synced: native
+	// extensions built locally will not run on the remote's architecture, so the
+	// remote has to build its own.
+	Setup string `yaml:"setup"`
+
+	// Exclude adds to the default rsync excludes for this project.
+	Exclude []string `yaml:"exclude"`
+}
+
+// SetupFor returns the setup command for a project, if any.
+func (inv *Inventory) SetupFor(project string) string {
+	return inv.Exec[project].Setup
+}
+
+// ExcludesFor returns extra rsync excludes for a project.
+func (inv *Inventory) ExcludesFor(project string) []string {
+	return inv.Exec[project].Exclude
 }
 
 // Has reports whether the host declares the named capability.

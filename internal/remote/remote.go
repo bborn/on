@@ -112,7 +112,7 @@ func Command(target string, opts Options, cmd []string) []string {
 
 	remote := QuoteAll(cmd)
 	if opts.Dir != "" {
-		remote = fmt.Sprintf("cd %s && exec %s", Quote(opts.Dir), remote)
+		remote = fmt.Sprintf("cd %s && exec %s", QuotePath(opts.Dir), remote)
 	}
 	argv = append(argv, remote)
 	return argv

@@ -19,6 +19,7 @@ import (
 
 	"github.com/bborn/on/internal/fleet"
 	"github.com/bborn/on/internal/inventory"
+	"github.com/bborn/on/internal/mirror"
 	"github.com/bborn/on/internal/remote"
 	"github.com/bborn/on/internal/session"
 )
@@ -27,6 +28,7 @@ const usage = `on — run work on another machine, interactively.
 
 usage:
   on [flags] <host> <command>...   run <command> on <host> in a tmux session, and attach
+  on exec [--repo <p>] <command>   sync this directory to a host and run there
   on ls                            list hosts with load and free memory
   on ps                            list live sessions across the fleet
   on attach <host> [name]          reattach to a session
@@ -74,6 +76,8 @@ func run(args []string) error {
 		return cmdAttach(args[1:])
 	case "kill":
 		return cmdKill(args[1:])
+	case "exec":
+		return cmdExec(args[1:])
 	case "completion":
 		return cmdCompletion(args[1:])
 
@@ -553,6 +557,7 @@ _on() {
     'ps:list live sessions across the fleet'
     'attach:reattach to a session'
     'kill:end a session'
+    'exec:sync this directory to a host and run a command there'
     'init:write a starter inventory'
     'completion:output a shell completion script'
   )
@@ -582,6 +587,9 @@ _on() {
       ;;
     completion)
       (( CURRENT == 3 )) && _values 'shell' zsh bash
+      return
+      ;;
+    exec)
       return
       ;;
     ls|ps|init)
@@ -675,4 +683,124 @@ func merge(before, after opts) opts {
 		before.fresh = true
 	}
 	return before
+}
+
+// cmdExec syncs the current tree to a host and runs a command against it.
+//
+// This is the case where the work is uncommitted: an agent has just edited files
+// and wants the tests run somewhere with spare CPU. Committing first is not an
+// option, so the tree is mirrored at the moment of invocation.
+func cmdExec(args []string) error {
+	o, rest, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: on exec [--repo <project>] <command>...")
+	}
+
+	inv, err := load()
+	if err != nil {
+		return err
+	}
+
+	local, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	// An explicit host wins; otherwise infer the project from the checkout we are
+	// standing in, so `on exec bin/rails test` needs no arguments at all.
+	var host inventory.Host
+	cmd := rest
+	if h, ok := inv.Hosts[rest[0]]; ok {
+		host, cmd = h, rest[1:]
+		after, remainder, ferr := parseFlags(cmd)
+		if ferr != nil {
+			return ferr
+		}
+		o, cmd = merge(o, after), remainder
+	}
+	if len(cmd) == 0 {
+		return fmt.Errorf("no command given — try `on exec bin/rails test`")
+	}
+
+	repo := o.repo
+	if repo == "" {
+		repo = detectProject(inv, local)
+	}
+	if host.Name == "" {
+		if repo == "" {
+			return fmt.Errorf("could not tell which project %s belongs to — pass --repo or a host", local)
+		}
+		if host, err = pickHostFor(inv, repo); err != nil {
+			return err
+		}
+	}
+
+	remotePath := mirror.Path(host.Workdir, local)
+	setup := inv.SetupFor(repo)
+
+	fmt.Fprintf(os.Stderr, "→ %s  syncing %s\n", host.Name, filepath.Base(local))
+
+	sync := mirror.RsyncArgs(host.SSH, local, remotePath,
+		mirror.Options{Delete: true, Progress: true, Extra: inv.ExcludesFor(repo)})
+	rs := exec.Command(sync[0], sync[1:]...)
+	rs.Stdout, rs.Stderr = os.Stderr, os.Stderr
+	if err := rs.Run(); err != nil {
+		return fmt.Errorf("sync to %s failed: %w", host.Name, err)
+	}
+
+	script := mirror.RunScript(remotePath, setup, cmd)
+	argv := remote.Command(host.SSH, remote.Options{TTY: isTerminal()}, []string{"sh", "-c", script})
+
+	run := exec.Command(argv[0], argv[1:]...)
+	run.Stdin, run.Stdout, run.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := run.Run(); err != nil {
+		// Propagate the remote exit code, so a failing test suite fails the
+		// caller exactly as a local run would.
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		return err
+	}
+	return nil
+}
+
+// detectProject matches the checkout's git remote against the inventory, so the
+// project need not be named when standing inside it.
+func detectProject(inv *inventory.Inventory, dir string) string {
+	out, err := exec.Command("git", "-C", dir, "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	origin := normalizeGitURL(strings.TrimSpace(string(out)))
+	if origin == "" {
+		return ""
+	}
+	for name, url := range inv.Repos {
+		if normalizeGitURL(url) == origin {
+			return name
+		}
+	}
+	return ""
+}
+
+// normalizeGitURL reduces the forms of a git remote to "host/owner/repo", so
+// that ssh and https remotes for the same repository compare equal.
+func normalizeGitURL(u string) string {
+	u = strings.TrimSuffix(strings.TrimSpace(u), ".git")
+	u = strings.TrimPrefix(u, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	u = strings.TrimPrefix(u, "ssh://")
+	if i := strings.Index(u, "@"); i >= 0 {
+		u = u[i+1:]
+	}
+	u = strings.Replace(u, ":", "/", 1)
+	return strings.ToLower(strings.Trim(u, "/"))
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
