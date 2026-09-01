@@ -34,7 +34,6 @@ on init          # writes ~/.config/on/hosts.yaml
 ## Inventory
 
 ```yaml
-hosts:
 # Clone URLs, used when a host is asked for a project it does not have yet.
 repos:
   myapp: git@github.com:me/myapp.git
@@ -152,8 +151,8 @@ With `--repo` the host is chosen for you, so `on` prints the target before
 attaching and labels the tmux status bar:
 
 ```
-→ ol-agents  ~/projects/engineering
-[ol-agents] on-offerlab-claude
+→ builder  ~/projects/engineering
+[builder] on-myapp-claude
 ```
 
 The label is the inventory name, not tmux's `#H`: one machine reached as two

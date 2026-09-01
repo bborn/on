@@ -36,8 +36,8 @@ type Host struct {
 
 	// Repos maps a project name to its checkout path on this host.
 	//
-	// Directory names are not project names: a checkout of offerlab may live at
-	// ~/projects/engineering on one host and ~/Projects/offerlab on another, so
+	// Directory names are not project names: a checkout of myapp may live at
+	// ~/projects/engineering on one host and ~/Projects/myapp on another, so
 	// the mapping has to be explicit rather than inferred from the path.
 	Repos map[string]string `yaml:"repos"`
 }
