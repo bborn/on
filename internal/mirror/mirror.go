@@ -15,7 +15,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -177,8 +179,71 @@ func RsyncArgs(target, localPath, remotePath string, o Options) []string {
 	return args
 }
 
-// RunScript is the remote script that runs cmd in the mirror, after an optional
-// setup step.
+// StampRoot and LockRoot sit beside the mirrors rather than inside them.
+//
+// Anything written into a mirror is subject to --delete on the next sync, which
+// would erase a stamp on every run and make a once-per-mirror step run every
+// time. Keeping this bookkeeping outside the synced tree also means it never
+// shows up in a `git status` taken over ssh.
+const (
+	StampRoot = MirrorRoot + "/.stamps"
+	LockRoot  = MirrorRoot + "/.locks"
+)
+
+// StampPath returns the file whose modification time records when a tree's
+// mirror was last prepared.
+func StampPath(workdir, localPath string) string {
+	return strings.TrimRight(workdir, "/") + "/" + StampRoot + "/" +
+		filepath.Base(Path(workdir, localPath))
+}
+
+// LockPath returns the lock file for a named lock on a host.
+//
+// The name is a config value, so it is reduced to one safe path segment: a lock
+// called "app/test" must not be able to write outside LockRoot.
+func LockPath(workdir, name string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			return r
+		}
+		return '-'
+	}, name)
+	return strings.TrimRight(workdir, "/") + "/" + LockRoot + "/" + safe + ".lock"
+}
+
+// Run describes what to execute inside a mirror.
+type Run struct {
+	// Path is the mirror directory on the remote host.
+	Path string
+
+	// Env is exported before everything else, so setup and prepare see it too.
+	Env map[string]string
+
+	// Setup runs on every invocation. Cheap and idempotent.
+	Setup string
+
+	// Prepare runs only when Stamp is missing or older than PrepareInputs.
+	Prepare string
+
+	// Stamp is the absolute remote path recording the last successful Prepare.
+	// Required when Prepare is set.
+	Stamp string
+
+	// PrepareInputs are paths relative to the mirror. When any is newer than
+	// Stamp, Prepare runs again. Empty means Prepare runs once per mirror.
+	PrepareInputs []string
+
+	// Lock is the absolute remote path of a lock file held for the duration of
+	// prepare and the command. Empty means no lock.
+	Lock string
+
+	// Cmd is the command itself.
+	Cmd []string
+}
+
+// RunScript is the remote script that runs a command in the mirror.
 //
 // The whole thing runs through a login shell. ssh without a tty starts a
 // non-login shell, so ~/.profile never runs and PATH is only what sshd
@@ -189,17 +254,97 @@ func RsyncArgs(target, localPath, remotePath string, o Options) []string {
 //
 // Setup runs before the command rather than being folded into it, so a failing
 // `bundle install` reports itself instead of surfacing later as a confusing
-// error from the test suite.
-func RunScript(remotePath, setup string, cmd []string) string {
+// error from the test suite. The same applies to prepare, only more so: its
+// failure mode is a test suite that runs but skips whatever needed the
+// artefacts, which is worse than not running at all because it looks green.
+//
+// Order is: environment, setup, lock, prepare, command. The lock is taken after
+// setup because setup touches only this mirror, and before prepare because
+// prepare and the command are what contend for the things a host shares — a
+// test database above all.
+func RunScript(r Run) string {
 	var inner strings.Builder
 
 	// QuotePath, not Quote: the mirror path carries the host's ~.
-	fmt.Fprintf(&inner, "cd %s || exit 1\n", remote.QuotePath(remotePath))
-	if setup != "" {
-		fmt.Fprintf(&inner, "%s || exit $?\n", setup)
+	fmt.Fprintf(&inner, "cd %s || exit 1\n", remote.QuotePath(r.Path))
+
+	for _, k := range sortedKeys(r.Env) {
+		fmt.Fprintf(&inner, "export %s=%s\n", k, remote.Quote(r.Env[k]))
 	}
+	if r.Setup != "" {
+		fmt.Fprintf(&inner, "%s || exit $?\n", r.Setup)
+	}
+	if r.Lock != "" {
+		writeLock(&inner, r.Lock)
+	}
+	if r.Prepare != "" && r.Stamp != "" {
+		writePrepare(&inner, r)
+	}
+
 	// exec so the command owns the exit status and signals directly.
-	fmt.Fprintf(&inner, "exec %s", remote.QuoteAll(cmd))
+	fmt.Fprintf(&inner, "exec %s", remote.QuoteAll(r.Cmd))
 
 	return "${SHELL:-/bin/sh} -lc " + remote.Quote(inner.String())
+}
+
+// writeLock emits a blocking flock held on a file descriptor.
+//
+// The descriptor is inherited across the final exec, so the lock lives exactly
+// as long as the command does and is released by the kernel however the command
+// dies — no trap to get wrong, nothing left held by a killed ssh.
+//
+// A host without flock runs unserialised rather than refusing to run, but says
+// so: silently dropping the guarantee is how you end up trusting a red suite
+// that has no regression behind it.
+func writeLock(w *strings.Builder, lockPath string) {
+	dir := remote.QuotePath(path.Dir(lockPath))
+	file := remote.QuotePath(lockPath)
+	name := remote.Quote(strings.TrimSuffix(path.Base(lockPath), ".lock"))
+
+	fmt.Fprintf(w, "mkdir -p %s || exit 1\n", dir)
+	fmt.Fprintf(w, "if command -v flock >/dev/null 2>&1; then\n")
+	fmt.Fprintf(w, "  exec 9>%s || exit 1\n", file)
+	fmt.Fprintf(w, "  flock -n 9 || { printf '→ waiting for %%s\\n' %s >&2; flock 9 || exit 1; }\n", name)
+	fmt.Fprintf(w, "else\n")
+	fmt.Fprintf(w, "  printf 'on: no flock on this host; %%s runs unserialised\\n' %s >&2\n", name)
+	fmt.Fprintf(w, "fi\n")
+}
+
+// writePrepare emits the staleness check around the prepare step.
+//
+// Staleness is mtime-based because rsync -a preserves modification times, so a
+// file edited locally arrives newer than the stamp of the last prepare. `find
+// | head -1` rather than `find -quit`, which is not in every find; the pipeline
+// stops at the first hit either way.
+//
+// With no inputs declared the step runs once and never again, which is what a
+// one-off bootstrap wants and is a trap for anything derived from source. The
+// config comment says so.
+func writePrepare(w *strings.Builder, r Run) {
+	stamp := remote.QuotePath(r.Stamp)
+
+	cond := fmt.Sprintf("[ ! -e %s ]", stamp)
+	if len(r.PrepareInputs) > 0 {
+		inputs := make([]string, len(r.PrepareInputs))
+		for i, in := range r.PrepareInputs {
+			inputs[i] = remote.Quote(in)
+		}
+		cond += fmt.Sprintf(" || [ -n \"$(find %s -newer %s -print 2>/dev/null | head -n 1)\" ]",
+			strings.Join(inputs, " "), stamp)
+	}
+
+	fmt.Fprintf(w, "if %s; then\n", cond)
+	fmt.Fprintf(w, "  printf '→ preparing mirror\\n' >&2\n")
+	fmt.Fprintf(w, "  %s || exit $?\n", r.Prepare)
+	fmt.Fprintf(w, "  mkdir -p %s && : > %s\n", remote.QuotePath(path.Dir(r.Stamp)), stamp)
+	fmt.Fprintf(w, "fi\n")
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

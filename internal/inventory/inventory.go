@@ -70,16 +70,51 @@ type ExecConfig struct {
 
 	// Exclude adds to the default rsync excludes for this project.
 	Exclude []string `yaml:"exclude"`
+
+	// Prepare runs in the mirror once, when it is first created, and again
+	// whenever PrepareInputs change. It is for work that is too expensive to
+	// repeat per run but whose absence is not a loud failure — the motivating
+	// case is `bin/rails assets:precompile`, without which every test that
+	// renders a layout raises an asset-pipeline error. Minitest counts those as
+	// errors rather than failures, so a run missing a quarter of its tests
+	// still prints "0 failures" and reads as a pass.
+	//
+	// Unlike Setup it may be slow, and unlike Setup its absence is silent, which
+	// is exactly why it belongs in the tool rather than in each caller's command
+	// line.
+	Prepare string `yaml:"prepare"`
+
+	// PrepareInputs are paths, relative to the mirror, whose modification times
+	// decide whether Prepare is stale. Empty means Prepare runs once per mirror
+	// and never again — right for a one-off bootstrap, wrong for anything
+	// derived from files you are editing.
+	PrepareInputs []string `yaml:"prepare_inputs"`
+
+	// Env is exported before Setup, Prepare and the command.
+	//
+	// This exists so a project can state the environment its remote runs need
+	// once, instead of every caller remembering to prefix it. `PARALLEL_WORKERS:
+	// "1"` is the motivating case: above Rails' 50-test parallelisation
+	// threshold, forked workers truncating tables against a live connection
+	// deadlock in Postgres, producing a wall of errors and zero assertion
+	// failures — a red suite with no regression behind it.
+	Env map[string]string `yaml:"env"`
+
+	// Lock serialises runs that share this name on a host. Empty means no lock.
+	//
+	// Mirrors are isolated from each other, but the things they talk to are not:
+	// two worktrees of one project on one host share a test database, so two
+	// concurrent runs corrupt each other's fixtures however few workers each
+	// uses. The lock is per host and named rather than implicit, so cheap
+	// commands are not made to queue behind test suites.
+	Lock string `yaml:"lock"`
 }
 
-// SetupFor returns the setup command for a project, if any.
-func (inv *Inventory) SetupFor(project string) string {
-	return inv.Exec[project].Setup
-}
-
-// ExcludesFor returns extra rsync excludes for a project.
-func (inv *Inventory) ExcludesFor(project string) []string {
-	return inv.Exec[project].Exclude
+// ExecFor returns the whole exec configuration for a project. The zero value is
+// meaningful — a project with no entry simply gets no setup, no prepare step and
+// no lock — so this never reports absence.
+func (inv *Inventory) ExecFor(project string) ExecConfig {
+	return inv.Exec[project]
 }
 
 // Has reports whether the host declares the named capability.
@@ -227,4 +262,24 @@ hosts:
 # Clone URLs, used when a host is asked for a project it does not have yet.
 # repos:
 #   myapp: git@github.com:me/myapp.git
+
+# Per-project settings for ` + "`on exec`" + `.
+# exec:
+#   myapp:
+#     setup: bundle install --quiet   # every run; must be cheap and idempotent
+#     exclude: [storage/]             # extra rsync excludes
+#
+#     # Once per mirror, and again when prepare_inputs change. For work too slow
+#     # to repeat per run whose absence is silent — un-precompiled assets make
+#     # Rails tests raise errors rather than failures, so the run still prints
+#     # "0 failures". Without prepare_inputs this runs once and never again.
+#     prepare: bin/rails assets:precompile
+#     prepare_inputs: [app/assets, app/javascript, package.json]
+#
+#     env:                            # exported before setup, prepare and cmd
+#       PARALLEL_WORKERS: "1"
+#
+#     # Serialise runs sharing this name on a host. Mirrors are isolated; the
+#     # test database they share is not.
+#     lock: myapp
 `

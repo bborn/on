@@ -141,6 +141,55 @@ exec:
 
 Keep `setup` cheap and idempotent — it runs on every invocation.
 
+### Preparing a mirror
+
+Some work is too slow to repeat per run but too important to leave out. Rails
+assets are the case that motivated this: without a precompile, every test that
+renders a layout raises `The asset "application.js" is not present in the asset
+pipeline`. Minitest counts that as an **error**, not a failure, so the run still
+prints `0 failures` and reads as a pass. On one real controller test that was 29
+of 115 tests and 100 of 366 assertions, silently not running.
+
+`prepare` runs once when a mirror is created, and again when the files it derives
+from change:
+
+```yaml
+exec:
+  myapp:
+    setup: bundle install --quiet
+    prepare: bin/rails assets:precompile
+    prepare_inputs: [app/assets, app/javascript, package.json, yarn.lock]
+```
+
+Staleness is decided by modification time — `rsync -a` preserves them, so a file
+you just edited arrives newer than the last prepare. **Omitting `prepare_inputs`
+means the step runs once per mirror and never again**, which is right for a
+one-off bootstrap and wrong for anything derived from source you are editing. A
+failing `prepare` aborts the run rather than letting the command proceed without
+what it needs.
+
+### Environment and serialisation
+
+```yaml
+exec:
+  myapp:
+    env:
+      PARALLEL_WORKERS: "1"
+    lock: myapp
+```
+
+`env` is exported before setup, prepare and the command, so a project states its
+remote environment once instead of every caller remembering to prefix it.
+
+`lock` serialises runs sharing that name on a host. Mirrors are isolated from
+each other; the things they talk to are not. Two concurrent `on exec` test runs
+against one host share a test database, and above Rails' 50-test parallelisation
+threshold they deadlock in Postgres — walls of `PG::TRDeadlockDetected` with zero
+assertion failures, which reads as a regression that does not exist. The lock is
+opt-in and named so cheap commands are not made to queue behind test suites, and
+it is held for exactly as long as the command runs. A host without `flock` says
+so on stderr and runs unserialised rather than pretending.
+
 Point an agent at it from `CLAUDE.md` or `AGENTS.md`:
 
 > Run tests with `on exec bin/rails test`, never `bin/rails test`.

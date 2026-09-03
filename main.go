@@ -739,24 +739,39 @@ func cmdExec(args []string) error {
 	}
 
 	remotePath := mirror.Path(host.Workdir, local)
-	setup := inv.SetupFor(repo)
+	cfg := inv.ExecFor(repo)
 
 	fmt.Fprintf(os.Stderr, "→ %s  syncing %s\n", host.Name, filepath.Base(local))
 
 	sync := mirror.RsyncArgs(host.SSH, local, remotePath,
-		mirror.Options{Delete: true, Progress: true, Extra: inv.ExcludesFor(repo)})
+		mirror.Options{Delete: true, Progress: true, Extra: cfg.Exclude})
 	rs := exec.Command(sync[0], sync[1:]...)
 	rs.Stdout, rs.Stderr = os.Stderr, os.Stderr
 	if err := rs.Run(); err != nil {
 		return fmt.Errorf("sync to %s failed: %w", host.Name, err)
 	}
 
-	script := mirror.RunScript(remotePath, setup, cmd)
+	run := mirror.Run{
+		Path:          remotePath,
+		Env:           cfg.Env,
+		Setup:         cfg.Setup,
+		Prepare:       cfg.Prepare,
+		PrepareInputs: cfg.PrepareInputs,
+		Cmd:           cmd,
+	}
+	if cfg.Prepare != "" {
+		run.Stamp = mirror.StampPath(host.Workdir, local)
+	}
+	if cfg.Lock != "" {
+		run.Lock = mirror.LockPath(host.Workdir, cfg.Lock)
+	}
+
+	script := mirror.RunScript(run)
 	argv := remote.Command(host.SSH, remote.Options{TTY: isTerminal()}, []string{"sh", "-c", script})
 
-	run := exec.Command(argv[0], argv[1:]...)
-	run.Stdin, run.Stdout, run.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := run.Run(); err != nil {
+	ssh := exec.Command(argv[0], argv[1:]...)
+	ssh.Stdin, ssh.Stdout, ssh.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := ssh.Run(); err != nil {
 		// Propagate the remote exit code, so a failing test suite fails the
 		// caller exactly as a local run would.
 		if ee, ok := err.(*exec.ExitError); ok {
