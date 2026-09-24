@@ -35,6 +35,10 @@ type DigitalOcean struct {
 	BaseURL string
 	Client  *http.Client
 
+	// Poll is how often waits check back; Wait bounds the wait for a new
+	// droplet's address. Tests shorten both.
+	Poll, Wait time.Duration
+
 	token  string
 	sizes  []doSize
 	image  *doImage
@@ -47,7 +51,7 @@ const doBaseImage = "ubuntu-24-04-x64"
 // NewDigitalOcean returns the pool's DigitalOcean provider.
 func NewDigitalOcean(p inventory.Pool, cfg inventory.ProviderConfig) *DigitalOcean {
 	return &DigitalOcean{Pool: p, Cfg: cfg, BaseURL: "https://api.digitalocean.com",
-		Client: &http.Client{Timeout: 60 * time.Second}}
+		Client: &http.Client{Timeout: 60 * time.Second}, Poll: 3 * time.Second, Wait: 3 * time.Minute}
 }
 
 func (d *DigitalOcean) Kind() string     { return "digitalocean" }
@@ -98,28 +102,46 @@ func expandHome(p string) string {
 
 // call makes one API request. A non-2xx answer is an error carrying the API's
 // own message, which is what says "size unavailable in this region".
+//
+// Rate limiting (429) is retried for any request, since it was not processed;
+// server errors only for GET and DELETE, which are safe to repeat. A long wait,
+// such as for a snapshot, should not die on one bad answer.
 func (d *DigitalOcean) call(method, path string, body, out any) error {
+	var err error
+	for attempt, backoff := 0, time.Second; attempt < 4; attempt, backoff = attempt+1, backoff*3 {
+		var status int
+		status, err = d.do(method, path, body, out)
+		retry := status == 429 || (status >= 500 && (method == "GET" || method == "DELETE"))
+		if err == nil || !retry {
+			return err
+		}
+		time.Sleep(backoff)
+	}
+	return err
+}
+
+func (d *DigitalOcean) do(method, path string, body, out any) (int, error) {
 	token, err := d.Token()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var rd io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		rd = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequest(method, d.BaseURL+path, rd)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("digitalocean %s %s: %w", method, path, err)
+		return 0, fmt.Errorf("digitalocean %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
@@ -131,14 +153,49 @@ func (d *DigitalOcean) call(method, path string, body, out any) error {
 		if e.Message == "" {
 			e.Message = strings.TrimSpace(string(raw))
 		}
-		return fmt.Errorf("digitalocean %s %s: %d %s", method, path, resp.StatusCode, e.Message)
+		return resp.StatusCode, fmt.Errorf("digitalocean %s %s: %d %s", method, path, resp.StatusCode, e.Message)
 	}
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
-			return fmt.Errorf("digitalocean %s %s: parsing response: %w", method, path, err)
+			return resp.StatusCode, fmt.Errorf("digitalocean %s %s: parsing response: %w", method, path, err)
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
+}
+
+// all GETs a list endpoint page by page, appending each page's items under key
+// to out. The account's snapshots and the size catalogue both outgrow one page,
+// and a truncated list reads as a missing image.
+func all[T any](d *DigitalOcean, path, key string) ([]T, error) {
+	var items []T
+	for path != "" {
+		var page map[string]json.RawMessage
+		if err := d.call("GET", path, nil, &page); err != nil {
+			return nil, err
+		}
+		var got []T
+		if raw, ok := page[key]; ok {
+			if err := json.Unmarshal(raw, &got); err != nil {
+				return nil, fmt.Errorf("digitalocean GET %s: parsing %s: %w", path, key, err)
+			}
+		}
+		items = append(items, got...)
+		var links struct {
+			Pages struct {
+				Next string `json:"next"`
+			} `json:"pages"`
+		}
+		_ = json.Unmarshal(page["links"], &links)
+		path = ""
+		if links.Pages.Next != "" {
+			u, err := url.Parse(links.Pages.Next)
+			if err != nil {
+				return nil, err
+			}
+			path = u.RequestURI()
+		}
+	}
+	return items, nil
 }
 
 type doDroplet struct {
@@ -196,17 +253,20 @@ func (dr doDroplet) server() Server {
 }
 
 // List returns the pool's droplets, oldest first.
-func (d *DigitalOcean) List() ([]Server, error) {
-	var resp struct {
-		Droplets []doDroplet `json:"droplets"`
-	}
+func (d *DigitalOcean) List() ([]Server, error) { return d.list(managedValue) }
+
+// Builders returns the pool's image builders.
+func (d *DigitalOcean) Builders() ([]Server, error) { return d.list(builderValue) }
+
+func (d *DigitalOcean) list(managed string) ([]Server, error) {
 	q := url.Values{"tag_name": {tag(LabelPool, d.Pool.Name)}, "per_page": {"200"}}
-	if err := d.call("GET", "/v2/droplets?"+q.Encode(), nil, &resp); err != nil {
+	droplets, err := all[doDroplet](d, "/v2/droplets?"+q.Encode(), "droplets")
+	if err != nil {
 		return nil, err
 	}
 	var servers []Server
-	for _, dr := range resp.Droplets {
-		if contains(dr.Tags, tag(LabelManaged, managedValue)) {
+	for _, dr := range droplets {
+		if contains(dr.Tags, tag(LabelManaged, managed)) {
 			servers = append(servers, dr.server())
 		}
 	}
@@ -228,14 +288,12 @@ func (d *DigitalOcean) allSizes() ([]doSize, error) {
 	if d.sizes != nil {
 		return d.sizes, nil
 	}
-	var resp struct {
-		Sizes []doSize `json:"sizes"`
-	}
-	if err := d.call("GET", "/v2/sizes?per_page=200", nil, &resp); err != nil {
+	sizes, err := all[doSize](d, "/v2/sizes?per_page=200", "sizes")
+	if err != nil {
 		return nil, err
 	}
-	d.sizes = resp.Sizes
-	return d.sizes, nil
+	d.sizes = sizes
+	return sizes, nil
 }
 
 type doImage struct {
@@ -249,14 +307,12 @@ type doImage struct {
 
 // images lists the pool image's snapshots, newest first.
 func (d *DigitalOcean) images() ([]doImage, error) {
-	var resp struct {
-		Images []doImage `json:"images"`
-	}
-	if err := d.call("GET", "/v2/images?private=true&per_page=200", nil, &resp); err != nil {
+	images, err := all[doImage](d, "/v2/images?private=true&per_page=200", "images")
+	if err != nil {
 		return nil, err
 	}
 	var out []doImage
-	for _, im := range resp.Images {
+	for _, im := range images {
 		if contains(im.Tags, tag(LabelImage, d.Pool.Image)) {
 			out = append(out, im)
 		}
@@ -306,7 +362,8 @@ func (d *DigitalOcean) Offers(build bool) ([]Offer, error) {
 		if !sz.Available || sz.Disk < minDisk || strings.HasPrefix(sz.Slug, "gpu-") {
 			continue
 		}
-		if len(d.Cfg.Types) > 0 && !contains(d.Cfg.Types, sz.Slug) {
+		// types: limits pool servers; a builder is not one (see Hetzner.Offers).
+		if !build && len(d.Cfg.Types) > 0 && !contains(d.Cfg.Types, sz.Slug) {
 			continue
 		}
 		for _, r := range sz.Regions {
@@ -326,19 +383,18 @@ func (d *DigitalOcean) sshKeyIDs() ([]int64, error) {
 	if d.keyIDs != nil || len(d.Cfg.SSHKeys) == 0 {
 		return d.keyIDs, nil
 	}
-	var resp struct {
-		Keys []struct {
-			ID   int64  `json:"id"`
-			Name string `json:"name"`
-		} `json:"ssh_keys"`
+	type key struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
 	}
-	if err := d.call("GET", "/v2/account/keys?per_page=200", nil, &resp); err != nil {
+	keys, err := all[key](d, "/v2/account/keys?per_page=200", "ssh_keys")
+	if err != nil {
 		return nil, err
 	}
 	var ids []int64
 	for _, want := range d.Cfg.SSHKeys {
 		found := false
-		for _, k := range resp.Keys {
+		for _, k := range keys {
 			if k.Name == want {
 				ids, found = append(ids, k.ID), true
 				break
@@ -365,16 +421,16 @@ func (d *DigitalOcean) Create(name string, o Offer, now time.Time) (Server, erro
 	})
 }
 
-// CreateBuilder boots plain Ubuntu, tagged on:builder so no pool lists it.
+// CreateBuilder boots plain Ubuntu, tagged on:builder so it is never taken for a
+// pool server, and with the pool so `on reap` and `on down` can find it.
 func (d *DigitalOcean) CreateBuilder(name string, o Offer) (Server, error) {
-	return d.create(name, o, doBaseImage, []string{tag(LabelManaged, "builder")})
+	return d.create(name, o, doBaseImage, []string{tag(LabelManaged, builderValue), tag(LabelPool, d.Pool.Name)})
 }
-
-// dropletPoll is how often and how long create waits for the droplet's address.
-var dropletPoll, dropletWait = 3 * time.Second, 3 * time.Minute
 
 // create boots a droplet and waits for its public address: DigitalOcean
 // assigns it after the create call returns, and `on` reaches servers by address.
+// A droplet that never gets one is deleted, not left billing: the caller moves
+// on to the next offer and would never see it again.
 func (d *DigitalOcean) create(name string, o Offer, image any, tags []string) (Server, error) {
 	keys, err := d.sshKeyIDs()
 	if err != nil {
@@ -388,22 +444,29 @@ func (d *DigitalOcean) create(name string, o Offer, image any, tags []string) (S
 	if err := d.call("POST", "/v2/droplets", body, &created); err != nil {
 		return Server{}, err
 	}
-	deadline := time.Now().Add(dropletWait)
+	id := created.Droplet.ID
+	if id == 0 {
+		return Server{}, fmt.Errorf("digitalocean created %s but returned no droplet id — check the account for it", name)
+	}
+	deadline := time.Now().Add(d.Wait)
 	for {
 		var got struct {
 			Droplet doDroplet `json:"droplet"`
 		}
-		err := d.call("GET", fmt.Sprintf("/v2/droplets/%d", created.Droplet.ID), nil, &got)
+		err := d.call("GET", fmt.Sprintf("/v2/droplets/%d", id), nil, &got)
 		if err == nil {
 			if s := got.Droplet.server(); s.IP != "" {
 				return s, nil
 			}
 		}
 		if time.Now().After(deadline) {
-			return Server{}, fmt.Errorf("droplet %s (%d) has no address after %s — delete it with `on down %s`",
-				name, created.Droplet.ID, dropletWait, name)
+			if derr := d.Delete(Server{ID: id, Name: name}); derr != nil {
+				return Server{}, fmt.Errorf("droplet %s (%d) had no address after %s, and deleting it failed — `on down %s`: %v",
+					name, id, d.Wait, name, derr)
+			}
+			return Server{}, fmt.Errorf("droplet %s had no address after %s; deleted it", name, d.Wait)
 		}
-		time.Sleep(dropletPoll)
+		time.Sleep(d.Poll)
 	}
 }
 
@@ -432,7 +495,7 @@ func (d *DigitalOcean) waitAction(a doAction, wait time.Duration) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("digitalocean action %d still %s after %s", a.ID, a.Status, wait)
 		}
-		time.Sleep(dropletPoll)
+		time.Sleep(d.Poll)
 		var resp struct {
 			Action doAction `json:"action"`
 		}
@@ -452,10 +515,19 @@ func (d *DigitalOcean) SaveImage(b Server, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if err := d.action(b.ID, map[string]any{"type": "power_off"}, 5*time.Minute); err != nil {
+	// Powering off a droplet that is already off is refused, so look first.
+	var cur struct {
+		Droplet doDroplet `json:"droplet"`
+	}
+	if err := d.call("GET", fmt.Sprintf("/v2/droplets/%d", b.ID), nil, &cur); err != nil {
 		return err
 	}
-	name := fmt.Sprintf("on-%s-%s", d.Pool.Image, now.UTC().Format("20060102-1504"))
+	if cur.Droplet.Status != "off" {
+		if err := d.action(b.ID, map[string]any{"type": "power_off"}, 5*time.Minute); err != nil {
+			return err
+		}
+	}
+	name := fmt.Sprintf("on-%s-%d", d.Pool.Image, now.Unix())
 	if err := d.action(b.ID, map[string]any{"type": "snapshot", "name": name}, 90*time.Minute); err != nil {
 		return err
 	}
@@ -481,6 +553,17 @@ func (d *DigitalOcean) SaveImage(b Server, now time.Time) error {
 		return err
 	}
 	d.image = nil
+	// A rebuild during a budget pause must not lift it: the mark lives on the
+	// newest image, which is now this one.
+	if len(old) > 0 {
+		for _, t := range old[0].Tags {
+			if strings.HasPrefix(t, LabelPaused+":") {
+				if err := d.tagResource(t, "image", id); err != nil {
+					return fmt.Errorf("new image saved, but carrying the pause mark over failed: %w", err)
+				}
+			}
+		}
+	}
 	for _, r := range d.Cfg.Locations {
 		if r == b.Location {
 			continue

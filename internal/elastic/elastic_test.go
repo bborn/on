@@ -67,7 +67,15 @@ func TestLedgerChargesStartedHoursOnce(t *testing.T) {
 		t.Fatalf("spent = %v, want 1.5", spent)
 	}
 
-	l.Forget("ol", map[string]bool{})
+	unreachable := func(string) bool { return false }
+	l.Forget("ol", map[string]bool{}, unreachable)
+	if _, ok := l.Billed["a"]; !ok {
+		t.Fatal("a server whose provider did not answer must not be forgotten, or its hours bill twice")
+	}
+	if got := l.Charge("ol", s, 0.5, created.Add(2*time.Hour+30*time.Minute)); got != 0 {
+		t.Fatalf("after an outage the same hours must not bill again, got %v", got)
+	}
+	l.Forget("ol", map[string]bool{}, func(string) bool { return true })
 	if _, ok := l.Billed["a"]; ok {
 		t.Fatal("a server no longer present should be forgotten")
 	}

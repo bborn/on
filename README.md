@@ -278,7 +278,9 @@ provider keeps its own. `on image build <pool> <provider>` boots the cheapest
 plain Ubuntu 24.04 server of at least 4 CPU / 8 GB there, runs the pool's `build`
 script with the server's IP as its argument (it logs in as root), snapshots the
 result, deletes older snapshots, and deletes the server, even if the build
-fails (`--keep` leaves it for debugging). The builder is kept small because its
+fails or is interrupted (`--keep` leaves it for debugging). Builders carry the
+pool's label, so `on pools` shows them, `on down` deletes them, and `on reap`
+deletes any still around after three hours. The builder is kept small because its
 disk becomes the image's minimum disk. On DigitalOcean the snapshot is also
 copied to the pool's other regions, since a droplet can only boot from a
 snapshot in its own region; until a copy finishes, that region is not offered.
@@ -305,7 +307,10 @@ servers are never deleted, so set that up first.
 (DigitalOcean tags `on:elastic` and `on-pool:<pool>`), and `on` only ever lists or
 deletes servers with both, so a pool can share an account with servers `on` did
 not create. A provider that cannot be reached is reported and skipped, so it
-cannot hide the others' servers from `on reap`.
+cannot hide the others' servers from `on reap`. While one is unreachable the
+pool's count is partial, so `on exec` reuses what it can see but starts nothing
+new, and the ledger keeps the unreachable provider's tallies rather than billing
+their hours again later.
 
 ## Knowing where you are
 

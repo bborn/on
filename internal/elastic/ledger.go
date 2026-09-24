@@ -26,10 +26,11 @@ type Ledger struct {
 
 // BilledServer is the running tally for one server.
 type BilledServer struct {
-	Pool   string  `json:"pool"`
-	Hours  int     `json:"hours"`
-	Price  float64 `json:"price"`
-	SeenAt int64   `json:"seen_at"`
+	Pool     string  `json:"pool"`
+	Provider string  `json:"provider,omitempty"`
+	Hours    int     `json:"hours"`
+	Price    float64 `json:"price"`
+	SeenAt   int64   `json:"seen_at"`
 }
 
 // LedgerPath honours ON_LEDGER for tests.
@@ -98,14 +99,23 @@ func (l *Ledger) Charge(pool string, s Server, price float64, now time.Time) flo
 		l.Days[UTCDay(now)] = map[string]float64{}
 	}
 	l.Days[UTCDay(now)][pool] += delta
-	l.Billed[s.Name] = BilledServer{Pool: pool, Hours: max(started, prev.Hours), Price: price, SeenAt: now.Unix()}
+	l.Billed[s.Name] = BilledServer{Pool: pool, Provider: s.Provider, Hours: max(started, prev.Hours), Price: price, SeenAt: now.Unix()}
 	return delta
 }
 
 // Forget drops servers no longer present, so the ledger does not grow forever.
-func (l *Ledger) Forget(pool string, present map[string]bool) {
+//
+// Only servers of providers that answered the listing are forgotten. A server
+// missing because its provider could not be reached is still running; dropping
+// its tally would bill all its hours again once the provider is back, which
+// can push the day over budget and delete every server in the pool.
+func (l *Ledger) Forget(pool string, present map[string]bool, answered func(provider string) bool) {
 	for name, b := range l.Billed {
-		if b.Pool == pool && !present[name] {
+		provider := b.Provider
+		if provider == "" {
+			provider = "hetzner" // tallies from before pools had several providers
+		}
+		if b.Pool == pool && !present[name] && answered(provider) {
 			delete(l.Billed, name)
 		}
 	}

@@ -415,7 +415,15 @@ func Load(path string) (*Inventory, error) {
 			p.Providers[p.Provider] = ProviderConfig{Context: p.Context, Types: p.Types, Locations: p.Locations, SSHKeys: p.SSHKeys}
 		}
 		if p.Currency == "" {
+			// A single provider's own currency needs no rate; otherwise EUR.
 			p.Currency = DefaultPoolCurrency
+			if len(p.Providers) == 1 {
+				for pn := range p.Providers {
+					if cur, ok := ProviderCurrency[pn]; ok {
+						p.Currency = cur
+					}
+				}
+			}
 		}
 		if p.Image == "" || len(p.Providers) == 0 {
 			return nil, fmt.Errorf("pool %q needs an image and at least one provider", name)

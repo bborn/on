@@ -279,7 +279,7 @@ func TestLoadPoolFoldsTheSingleProviderForm(t *testing.T) {
 
 func TestLoadPoolNeedsARateForAForeignCurrency(t *testing.T) {
 	for name, body := range map[string]string{
-		"no rate for USD":    "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      digitalocean: {locations: [nyc3]}\n",
+		"no rate for USD":    "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    currency: EUR\n    providers:\n      digitalocean: {locations: [nyc3]}\n",
 		"no locations":       "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      hetzner: {context: c}\n",
 		"no size or types":   "elastic:\n  p:\n    image: x\n    providers:\n      hetzner: {locations: [fsn1]}\n",
 		"unknown provider":   "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      aws: {locations: [us-east-1]}\n",
@@ -290,5 +290,17 @@ func TestLoadPoolNeedsARateForAForeignCurrency(t *testing.T) {
 		if _, err := Load(path); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+func TestLoadPoolWithOneProviderUsesItsCurrency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hosts.yaml")
+	os.WriteFile(path, []byte("elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      digitalocean: {locations: [nyc3]}\n"), 0o600)
+	inv, err := Load(path)
+	if err != nil {
+		t.Fatalf("a DigitalOcean-only pool should need no rate: %v", err)
+	}
+	if c := inv.Elastic["p"].Currency; c != "USD" {
+		t.Fatalf("currency = %q, want USD", c)
 	}
 }

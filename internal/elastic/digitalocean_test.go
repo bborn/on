@@ -27,6 +27,8 @@ type doFake struct {
 	nextID   int64
 	pollsIP  int // GETs of a new droplet before it has an address
 	failSize string
+	noIP     bool // a new droplet never gets an address
+	paged    bool // serve sizes over two pages
 }
 
 func newDOFake() *doFake {
@@ -56,6 +58,11 @@ func (f *doFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.Path
 	switch {
+	case r.Method == "GET" && path == "/v2/sizes" && f.paged && r.URL.Query().Get("page") == "":
+		// Page one holds only a size too small for the pool; the one that
+		// qualifies is on page two, behind an absolute next link.
+		io.WriteString(w, `{"sizes":[{"slug":"s-4vcpu-8gb","memory":8192,"vcpus":4,"disk":160,"price_hourly":0.071,"regions":["nyc3"],"available":true}],
+		 "links":{"pages":{"next":"https://api.digitalocean.com/v2/sizes?page=2&per_page=200"}}}`)
 	case r.Method == "GET" && path == "/v2/sizes":
 		io.WriteString(w, doSizesJSON)
 	case r.Method == "GET" && path == "/v2/images":
@@ -95,9 +102,13 @@ func (f *doFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		fmt.Sscanf(path, "/v2/droplets/%d", &id)
 		d := f.droplets[id]
+		if d == nil {
+			w.WriteHeader(404)
+			return
+		}
 		if f.pollsIP > 0 {
 			f.pollsIP--
-		} else if len(d.Networks.V4) == 0 {
+		} else if len(d.Networks.V4) == 0 && !f.noIP {
 			d.Status = "active"
 			d.Networks.V4 = append(d.Networks.V4, struct {
 				IP   string `json:"ip_address"`
@@ -153,6 +164,7 @@ func newTestDO(t *testing.T, f *doFake) *DigitalOcean {
 	t.Cleanup(srv.Close)
 	d := NewDigitalOcean(pool, doCfg)
 	d.BaseURL, d.token = srv.URL, "tok"
+	d.Poll = time.Millisecond
 	return d
 }
 
@@ -179,7 +191,6 @@ func TestDigitalOceanCreateWaitsForAnAddressAndTags(t *testing.T) {
 	f := newDOFake()
 	f.pollsIP = 2
 	d := newTestDO(t, f)
-	dropletPoll = time.Millisecond
 	now := time.Unix(1790260000, 0)
 	s, err := d.Create("on-ol-x", Offer{Provider: "digitalocean", Type: "s-8vcpu-32gb", Location: "nyc3"}, now)
 	if err != nil {
@@ -211,7 +222,6 @@ func TestDigitalOceanCreateWaitsForAnAddressAndTags(t *testing.T) {
 func TestDigitalOceanListIsScopedAndTouchReplacesTheTag(t *testing.T) {
 	f := newDOFake()
 	d := newTestDO(t, f)
-	dropletPoll = time.Millisecond
 	s, err := d.Create("on-ol-x", Offer{Type: "s-8vcpu-32gb", Location: "nyc3"}, time.Unix(1790260000, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -261,6 +271,7 @@ func (s *stub) Kind() string                                { return s.kind }
 func (s *stub) Currency() string                            { return s.currency }
 func (s *stub) Offers(bool) ([]Offer, error)                { return s.offers, nil }
 func (s *stub) List() ([]Server, error)                     { return s.servers, s.listErr }
+func (s *stub) Builders() ([]Server, error)                 { return nil, s.listErr }
 func (s *stub) CreateBuilder(string, Offer) (Server, error) { return Server{}, nil }
 func (s *stub) SaveImage(Server, time.Time) error           { return nil }
 func (s *stub) Touch(Server, time.Time) error               { return nil }
@@ -328,5 +339,125 @@ func TestManagerPausedOnAnyProviderRefusesCreate(t *testing.T) {
 	m := &Manager{Pool: pool, Providers: []Provider{hz, do}}
 	if _, err := m.Create(now); !errors.Is(err, ErrPaused) {
 		t.Fatalf("want ErrPaused, got %v", err)
+	}
+}
+
+func TestDigitalOceanDeletesADropletThatNeverGetsAnAddress(t *testing.T) {
+	f := newDOFake()
+	f.noIP = true
+	d := newTestDO(t, f)
+	d.Wait = 20 * time.Millisecond
+	_, err := d.Create("on-ol-x", Offer{Type: "s-8vcpu-32gb", Location: "nyc3"}, time.Now())
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if len(f.droplets) != 0 {
+		t.Fatalf("the droplet must be deleted, not left billing: %d left", len(f.droplets))
+	}
+}
+
+func TestDigitalOceanFollowsPages(t *testing.T) {
+	f := newDOFake()
+	f.paged = true
+	d := newTestDO(t, f)
+	m := &Manager{Pool: pool, Providers: []Provider{d}}
+	offers, err := m.Offers(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offers) == 0 {
+		t.Fatalf("the qualifying size is on page two; calls: %v", f.calls)
+	}
+}
+
+func TestBuilderOffersIgnoreThePoolsTypes(t *testing.T) {
+	d := newTestDO(t, newDOFake())
+	d.Cfg.Types = []string{"s-8vcpu-32gb"}
+	m := &Manager{Pool: pool, Providers: []Provider{d}}
+	offers, err := m.Offers(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offers) == 0 || offers[0].Type != "s-4vcpu-8gb" {
+		t.Fatalf("the builder should be the cheapest 4 CPU / 8 GB, not a pinned pool type: %v", offers)
+	}
+}
+
+func TestManagerCreateUsesAFreshNameEachAttempt(t *testing.T) {
+	var names []string
+	hz := &naming{stub: stub{kind: "hetzner", currency: "EUR", fail: map[string]bool{"a": true, "b": true},
+		offers: []Offer{
+			{Provider: "hetzner", Type: "a", CPUs: 16, MemoryGB: 32, Price: 0.1},
+			{Provider: "hetzner", Type: "b", CPUs: 16, MemoryGB: 32, Price: 0.2},
+			{Provider: "hetzner", Type: "c", CPUs: 16, MemoryGB: 32, Price: 0.3},
+		}}, names: &names}
+	m := &Manager{Pool: pool, Providers: []Provider{hz}}
+	if _, err := m.Create(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 3 || names[0] == names[1] || names[1] == names[2] {
+		t.Fatalf("each attempt needs its own name, got %v", names)
+	}
+}
+
+type naming struct {
+	stub
+	names *[]string
+}
+
+func (n *naming) Create(name string, o Offer, now time.Time) (Server, error) {
+	*n.names = append(*n.names, name)
+	return n.stub.Create(name, o, now)
+}
+
+// pausable records Pause calls, and can refuse them.
+type pausable struct {
+	stub
+	refuse bool
+	calls  int
+}
+
+func (p *pausable) Pause(day string) error {
+	p.calls++
+	if p.refuse {
+		return errors.New("unreachable")
+	}
+	p.paused = day
+	return nil
+}
+
+func TestManagerPauseRetriesTheProviderThatMissedIt(t *testing.T) {
+	hz := &pausable{stub: stub{kind: "hetzner", currency: "EUR"}}
+	do := &pausable{stub: stub{kind: "digitalocean", currency: "USD"}, refuse: true}
+	m := &Manager{Pool: pool, Providers: []Provider{hz, do}}
+	if err := m.Pause("2026-09-24"); err == nil {
+		t.Fatal("a provider that could not be marked must be reported")
+	}
+	if m.PausedEverywhere("2026-09-24") {
+		t.Fatal("not paused everywhere while one provider is unmarked")
+	}
+	do.refuse = false
+	if err := m.Pause("2026-09-24"); err != nil {
+		t.Fatal(err)
+	}
+	if hz.calls != 1 || do.calls != 2 || !m.PausedEverywhere("2026-09-24") {
+		t.Fatalf("the retry should mark only the one that missed it: hetzner %d, digitalocean %d", hz.calls, do.calls)
+	}
+}
+
+func TestManagerRecordsWhichProvidersFailedToList(t *testing.T) {
+	hz := &stub{kind: "hetzner", currency: "EUR"}
+	do := &stub{kind: "digitalocean", currency: "USD", listErr: errors.New("503")}
+	m := &Manager{Pool: pool, Providers: []Provider{hz, do}, Warn: io.Discard}
+	if _, err := m.List(); err != nil {
+		t.Fatal(err)
+	}
+	if m.Answered("digitalocean") || !m.Answered("hetzner") {
+		t.Fatalf("Failed = %v", m.Failed)
+	}
+	do.listErr = nil
+	m.List()
+	if len(m.Failed) != 0 {
+		t.Fatalf("a later successful List must clear Failed, got %v", m.Failed)
 	}
 }

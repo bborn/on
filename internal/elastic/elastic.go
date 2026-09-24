@@ -31,6 +31,7 @@ const (
 	LabelImage    = "on-image"     // on snapshots: which pool image this is
 	LabelPaused   = "on-paused"    // on the snapshot: UTC day the daily budget ran out
 	managedValue  = "elastic"
+	builderValue  = "builder" // LabelManaged on `on image build` servers
 )
 
 // Server is one on-demand host.

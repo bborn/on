@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/bborn/on/internal/elastic"
@@ -93,12 +96,27 @@ func cmdImage(args []string) error {
 	pr, _ := m.Provider(rest[2])
 	fmt.Fprintf(os.Stderr, "→ builder: %s (%.3f %s/h)\n", offer, offer.Cost, pool.Currency)
 	if !keep {
-		defer func() {
-			if err := pr.Delete(builder); err != nil {
-				fmt.Fprintf(os.Stderr, "deleting builder %s failed — delete it by hand: %v\n", builder.Name, err)
-			} else {
-				fmt.Fprintf(os.Stderr, "deleted builder %s\n", builder.Name)
-			}
+		var once sync.Once
+		cleanup := func() {
+			once.Do(func() {
+				if err := pr.Delete(builder); err != nil {
+					fmt.Fprintf(os.Stderr, "deleting builder %s failed — `on down %s`: %v\n", builder.Name, builder.Name, err)
+				} else {
+					fmt.Fprintf(os.Stderr, "deleted builder %s\n", builder.Name)
+				}
+			})
+		}
+		defer cleanup()
+		// A build runs for a long time in a terminal, and Ctrl-C is how it is
+		// abandoned; the builder must not outlive that. (`on reap` deletes any
+		// that still do once they are BuilderMaxAge old.)
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		go func() {
+			sig := <-sigs
+			fmt.Fprintf(os.Stderr, "\n%s: deleting the builder before exiting\n", sig)
+			cleanup()
+			os.Exit(130)
 		}()
 	}
 

@@ -62,6 +62,13 @@ func acquire(pool inventory.Pool, forceNew bool) (placement, error) {
 	if err != nil {
 		return placement{}, err
 	}
+	// With a provider unreachable the count is partial, so max_servers cannot
+	// be trusted: reuse what is visible, but start nothing new.
+	var noNew error
+	if len(h.Failed) > 0 {
+		noNew = fmt.Errorf("pool %s: cannot list servers on %s, so not starting another (max_servers %d)",
+			pool.Name, strings.Join(h.Failed, ", "), pool.MaxServers)
+	}
 
 	if !forceNew {
 		var running []elastic.Server
@@ -83,6 +90,9 @@ func acquire(pool inventory.Pool, forceNew bool) (placement, error) {
 		}
 	} else if len(servers) >= pool.MaxServers {
 		return placement{}, fmt.Errorf("pool %s is at max_servers (%d)", pool.Name, pool.MaxServers)
+	}
+	if noNew != nil {
+		return placement{}, noNew
 	}
 
 	start := time.Now()
@@ -222,7 +232,11 @@ func cmdDown(args []string) error {
 		if err != nil {
 			return err
 		}
-		for _, s := range servers {
+		builders, err := h.Builders()
+		if err != nil {
+			return err
+		}
+		for _, s := range append(servers, builders...) {
 			if err := deleteServer(h, s); err != nil {
 				return err
 			}
@@ -241,7 +255,11 @@ func cmdDown(args []string) error {
 			if err != nil {
 				return err
 			}
-			for _, s := range servers {
+			builders, err := h.Builders()
+			if err != nil {
+				return err
+			}
+			for _, s := range append(servers, builders...) {
 				if s.Name == name {
 					found = true
 					if err := deleteServer(h, s); err != nil {
@@ -293,14 +311,38 @@ func cmdReap(args []string) error {
 			continue
 		}
 
+		answered := h.Answered
+		// Builders cost money too, and one a crashed or interrupted build left
+		// behind is visible nowhere else.
+		builders, berr := h.Builders()
+		if berr != nil {
+			fmt.Fprintf(os.Stderr, "%s: listing builders: %v\n", pn, berr)
+		}
 		present := map[string]bool{}
-		for _, s := range servers {
+		for _, s := range append(append([]elastic.Server{}, servers...), builders...) {
 			present[s.Name] = true
 			if !dry {
 				ledger.Charge(pn, s, h.HourlyPrice(s), now)
 			}
 		}
-		ledger.Forget(pn, present)
+		if berr == nil {
+			ledger.Forget(pn, present, answered)
+		}
+		for _, b := range builders {
+			age := now.Sub(b.Created)
+			if age < elastic.BuilderMaxAge {
+				fmt.Printf("%-24s keep    builder (%s old)\n", b.Name, age.Round(time.Minute))
+				continue
+			}
+			action := "delete"
+			if !dry {
+				if err := deleteServer(h, b); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: %v\n", b.Name, err)
+					action = "FAILED"
+				}
+			}
+			fmt.Printf("%-24s %-7s builder left behind (%s old)\n", b.Name, action, age.Round(time.Minute))
+		}
 		spent := ledger.Spent(pn, today)
 		over := pool.DailyBudget > 0 && spent >= pool.DailyBudget
 
@@ -326,11 +368,14 @@ func cmdReap(args []string) error {
 
 		if !dry {
 			switch paused := h.PausedDay(); {
-			case over && paused != today:
+			case over && !h.PausedEverywhere(today):
+				// Every run until each provider's image carries the mark, so one
+				// that was unreachable last time is marked when it is back.
 				if err := h.Pause(today); err != nil {
-					fmt.Fprintf(os.Stderr, "%s: pausing: %v\n", pn, err)
+					fmt.Fprintf(os.Stderr, "%s: daily budget reached, but pausing failed: %v\n", pn, err)
+				} else {
+					fmt.Printf("%s: daily budget %.2f %s reached (spent %.2f) — paused until tomorrow UTC\n", pn, pool.DailyBudget, pool.Currency, spent)
 				}
-				fmt.Printf("%s: daily budget %.2f %s reached (spent %.2f) — paused until tomorrow UTC\n", pn, pool.DailyBudget, pool.Currency, spent)
 			case !over && paused != "" && paused != today:
 				if err := h.Unpause(); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: unpausing: %v\n", pn, err)
@@ -359,9 +404,13 @@ type poolReport struct {
 	SpentToday  float64        `json:"spent_today"`
 	Servers     []serverReport `json:"servers"`
 	Error       string         `json:"error,omitempty"`
+	// Unreachable names providers that could not be listed: their servers are
+	// missing from Servers but may still be running and billed.
+	Unreachable []string `json:"unreachable,omitempty"`
 }
 
 type serverReport struct {
+	Role        string    `json:"role"` // "server", or "builder" for `on image build`
 	Provider    string    `json:"provider"`
 	Name        string    `json:"name"`
 	IP          string    `json:"ip"`
@@ -397,9 +446,15 @@ func cmdPools(args []string) error {
 			reports = append(reports, r)
 			continue
 		}
+		r.Unreachable = h.Failed
+		builders, _ := h.Builders()
 		r.Paused = h.PausedDay()
 		for _, s := range servers {
-			r.Servers = append(r.Servers, serverReport{s.Provider, s.Name, s.IP, s.Status, s.Type, s.Location, s.Created, s.LastUsed,
+			r.Servers = append(r.Servers, serverReport{"server", s.Provider, s.Name, s.IP, s.Status, s.Type, s.Location, s.Created, s.LastUsed,
+				h.HourlyPrice(s)})
+		}
+		for _, s := range builders {
+			r.Servers = append(r.Servers, serverReport{"builder", s.Provider, s.Name, s.IP, s.Status, s.Type, s.Location, s.Created, s.LastUsed,
 				h.HourlyPrice(s)})
 		}
 		reports = append(reports, r)
@@ -422,9 +477,16 @@ func cmdPools(args []string) error {
 		if r.Error != "" {
 			fmt.Printf("  error: %s\n", r.Error)
 		}
+		if len(r.Unreachable) > 0 {
+			fmt.Printf("  could not list %s: its servers are not shown but may be running\n", strings.Join(r.Unreachable, ", "))
+		}
 		sort.Slice(r.Servers, func(i, j int) bool { return r.Servers[i].Created.Before(r.Servers[j].Created) })
 		for _, s := range r.Servers {
-			fmt.Printf("  %-22s %-9s %-12s %-14s %-5s up %-8s idle %-8s %.3f/h\n", s.Name, s.Status, s.Provider, s.Type, s.Location,
+			status := s.Status
+			if s.Role == "builder" {
+				status = "builder"
+			}
+			fmt.Printf("  %-22s %-9s %-12s %-14s %-5s up %-8s idle %-8s %.3f/h\n", s.Name, status, s.Provider, s.Type, s.Location,
 				now.Sub(s.Created).Round(time.Minute), now.Sub(s.LastUsed).Round(time.Minute), s.HourlyPrice)
 		}
 		if len(r.Servers) == 0 {

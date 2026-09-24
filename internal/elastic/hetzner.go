@@ -120,9 +120,14 @@ func (a apiServer) server() Server {
 }
 
 // List returns the pool's servers, oldest first.
-func (h *Hetzner) List() ([]Server, error) {
+func (h *Hetzner) List() ([]Server, error) { return h.list(managedValue) }
+
+// Builders returns the pool's image builders.
+func (h *Hetzner) Builders() ([]Server, error) { return h.list(builderValue) }
+
+func (h *Hetzner) list(managed string) ([]Server, error) {
 	out, err := h.Run("server", "list", "-o", "json",
-		"-l", fmt.Sprintf("%s=%s,%s=%s", LabelManaged, managedValue, LabelPool, h.Pool.Name))
+		"-l", fmt.Sprintf("%s=%s,%s=%s", LabelManaged, managed, LabelPool, h.Pool.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +247,9 @@ func (h *Hetzner) Offers(build bool) ([]Offer, error) {
 		if t.Architecture != "x86" || t.Deprecated || t.Deprecation != nil || float64(t.Disk) < minDisk {
 			continue
 		}
-		if len(h.Cfg.Types) > 0 && !contains(h.Cfg.Types, t.Name) {
+		// types: limits pool servers; a builder is not one, and a big pinned
+		// type would make a big image that smaller types cannot boot.
+		if !build && len(h.Cfg.Types) > 0 && !contains(h.Cfg.Types, t.Name) {
 			continue
 		}
 		for _, p := range t.Prices {
@@ -271,9 +278,13 @@ func (h *Hetzner) Create(name string, o Offer, now time.Time) (Server, error) {
 	})
 }
 
-// CreateBuilder boots plain Ubuntu, labelled on=builder so no pool lists it.
+// CreateBuilder boots plain Ubuntu, labelled on=builder so it is never taken for
+// a pool server, and with the pool so `on reap` and `on down` can find it.
 func (h *Hetzner) CreateBuilder(name string, o Offer) (Server, error) {
-	return h.create(name, o, hetznerBaseImage, []string{LabelManaged + "=builder"})
+	return h.create(name, o, hetznerBaseImage, []string{
+		fmt.Sprintf("%s=%s", LabelManaged, builderValue),
+		fmt.Sprintf("%s=%s", LabelPool, h.Pool.Name),
+	})
 }
 
 func (h *Hetzner) create(name string, o Offer, image string, labels []string) (Server, error) {
@@ -314,6 +325,13 @@ func (h *Hetzner) SaveImage(b Server, now time.Time) error {
 		return err
 	}
 	h.snap = nil
+	// A rebuild during a budget pause must not lift it: the mark lives on the
+	// newest image, which is now this one.
+	if len(old) > 0 && old[0].Labels[LabelPaused] != "" {
+		if err := h.Pause(old[0].Labels[LabelPaused]); err != nil {
+			return fmt.Errorf("new image saved, but carrying the pause mark over failed: %w", err)
+		}
+	}
 	for _, s := range old {
 		if _, err := h.Run("image", "delete", strconv.FormatInt(s.ID, 10)); err != nil {
 			return fmt.Errorf("new image saved, but deleting old snapshot %d failed: %w", s.ID, err)

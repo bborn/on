@@ -29,16 +29,23 @@ type Provider interface {
 	// List returns the pool's servers.
 	List() ([]Server, error)
 
+	// Builders returns the pool's image builders, so one a crashed or
+	// interrupted build left behind can still be found and deleted.
+	Builders() ([]Server, error)
+
 	// Create boots a pool server from the pool's image. It returns once the
-	// server has an address; it may not accept ssh yet.
+	// server has an address; it may not accept ssh yet. A server it created but
+	// cannot return (it never got an address, say) it deletes before failing.
 	Create(name string, o Offer, now time.Time) (Server, error)
 
-	// CreateBuilder boots a plain OS server for `on image build`, marked so it is
-	// never mistaken for a pool server.
+	// CreateBuilder boots a plain OS server for `on image build`, marked as the
+	// pool's builder so it is never mistaken for a pool server. Like Create, it
+	// deletes what it created if it cannot return it.
 	CreateBuilder(name string, o Offer) (Server, error)
 
 	// SaveImage powers the builder off, snapshots it as the pool's image, and
-	// retires older images. It does not delete the builder.
+	// retires older images, carrying a pause mark over to the new one. It does
+	// not delete the builder.
 	SaveImage(builder Server, now time.Time) error
 
 	Touch(s Server, now time.Time) error
@@ -84,6 +91,10 @@ const (
 	builderMinMemoryGB = 8
 )
 
+// Builders older than this are deleted by `on reap`: no build takes this long,
+// so it is one a crash or an interrupt left behind.
+const BuilderMaxAge = 3 * time.Hour
+
 // Manager runs one pool across its providers.
 type Manager struct {
 	Pool      inventory.Pool
@@ -91,6 +102,11 @@ type Manager struct {
 
 	// Warn receives errors from one provider that do not stop the others.
 	Warn io.Writer
+
+	// Failed names the providers the last List could not reach. The listing
+	// is then partial, and anything counting servers must not trust it: a
+	// missing server is not a deleted one.
+	Failed []string
 }
 
 // New returns a manager for the pool with a provider for each configured one.
@@ -125,15 +141,27 @@ func (m *Manager) warn(format string, args ...any) {
 }
 
 // List returns the pool's servers across providers, oldest first. One provider
-// failing is a warning, so a broken token on one cloud cannot hide, or block
-// the reaping of, servers on another. It is an error only when all fail.
+// failing is a warning, recorded in Failed, so a broken token on one cloud
+// cannot hide, or block the reaping of, servers on another. It is an error only
+// when all fail.
 func (m *Manager) List() ([]Server, error) {
+	return m.list(Provider.List)
+}
+
+// Builders returns the pool's image builders across providers, as List does.
+func (m *Manager) Builders() ([]Server, error) {
+	return m.list(Provider.Builders)
+}
+
+func (m *Manager) list(each func(Provider) ([]Server, error)) ([]Server, error) {
 	var all []Server
 	var errs []error
+	m.Failed = nil
 	for _, pr := range m.Providers {
-		servers, err := pr.List()
+		servers, err := each(pr)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", pr.Kind(), err))
+			m.Failed = append(m.Failed, pr.Kind())
 			continue
 		}
 		all = append(all, servers...)
@@ -146,6 +174,11 @@ func (m *Manager) List() ([]Server, error) {
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Created.Before(all[j].Created) })
 	return all, nil
+}
+
+// Answered reports whether the last List reached the provider.
+func (m *Manager) Answered(kind string) bool {
+	return !contains(m.Failed, kind)
 }
 
 // Offers returns what the pool could boot, cheapest first: every provider's
@@ -223,7 +256,6 @@ func (m *Manager) Create(now time.Time) (Server, error) {
 		return Server{}, fmt.Errorf("pool %s: no provider offers a server of at least %d CPU / %.0f GB that can boot image %s",
 			m.Pool.Name, m.Pool.MinCPUs, m.Pool.MinMemoryGB, m.Pool.Image)
 	}
-	name := fmt.Sprintf("on-%s-%s", m.Pool.Name, randomSuffix())
 	var failures []string
 	for i, o := range offers {
 		if i == maxAttempts {
@@ -231,6 +263,10 @@ func (m *Manager) Create(now time.Time) (Server, error) {
 			break
 		}
 		pr, _ := m.Provider(o.Provider)
+		// A fresh name each attempt: a failed attempt's server, if its delete
+		// failed too, must never share a name (an ssh alias, a ledger key) with
+		// the one that works.
+		name := fmt.Sprintf("on-%s-%s", m.Pool.Name, randomSuffix())
 		s, err := pr.Create(name, o, now)
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s %s@%s: %s", o.Provider, o.Type, o.Location, lastLine(err.Error())))
@@ -254,10 +290,12 @@ func (m *Manager) CreateBuilder(kind, name string) (Server, Offer, error) {
 		return Server{}, Offer{}, err
 	}
 	var failures []string
+	tried := 0
 	for _, o := range offers {
 		if o.Provider != kind {
 			continue
 		}
+		tried++
 		if len(failures) == maxAttempts {
 			failures = append(failures, "…more not tried")
 			break
@@ -267,6 +305,10 @@ func (m *Manager) CreateBuilder(kind, name string) (Server, Offer, error) {
 			return s, o, nil
 		}
 		failures = append(failures, fmt.Sprintf("%s@%s: %s", o.Type, o.Location, lastLine(err.Error())))
+	}
+	if tried == 0 {
+		return Server{}, Offer{}, fmt.Errorf("%s offers no server of at least %d CPU / %d GB in %s to build on",
+			kind, builderMinCPUs, builderMinMemoryGB, strings.Join(m.Pool.Providers[kind].Locations, ", "))
 	}
 	return Server{}, Offer{}, fmt.Errorf("no builder could start on %s: %s", kind, strings.Join(failures, "; "))
 }
@@ -310,9 +352,9 @@ func (m *Manager) HourlyPrice(s Server) float64 {
 	return pr.HourlyPrice(s) * rate
 }
 
-// PausedDay is the latest pause mark on any provider's image, or "". The mark
-// is on every provider's image, so a machine that can reach only one still
-// sees it.
+// PausedDay is the latest pause mark on any provider's image, or "". Any mark
+// for today stops new servers: a machine that can reach only one provider
+// still sees it there.
 func (m *Manager) PausedDay() string {
 	latest := ""
 	for _, pr := range m.Providers {
@@ -323,15 +365,29 @@ func (m *Manager) PausedDay() string {
 	return latest
 }
 
-// Pause marks every provider's image so no new server starts today.
+// Pause marks each provider's image that is not already marked for the day,
+// so a provider a previous Pause could not reach is marked on the next try.
 func (m *Manager) Pause(day string) error {
 	var errs []error
 	for _, pr := range m.Providers {
+		if pr.PausedDay() == day {
+			continue
+		}
 		if err := pr.Pause(day); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", pr.Kind(), err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// PausedEverywhere reports whether every provider's image carries the day's mark.
+func (m *Manager) PausedEverywhere(day string) bool {
+	for _, pr := range m.Providers {
+		if pr.PausedDay() != day {
+			return false
+		}
+	}
+	return true
 }
 
 // Unpause clears pause marks from an earlier day.
