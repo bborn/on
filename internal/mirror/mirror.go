@@ -239,6 +239,10 @@ type Run struct {
 	// prepare and the command. Empty means no lock.
 	Lock string
 
+	// Remove lists paths, relative to the mirror, deleted before anything runs:
+	// include files a previous --include run left that this run must not see.
+	Remove []string
+
 	// Cmd is the command itself.
 	Cmd []string
 }
@@ -262,11 +266,24 @@ type Run struct {
 // setup because setup touches only this mirror, and before prepare because
 // prepare and the command are what contend for the things a host shares — a
 // test database above all.
+//
+// The cd and the removal of stale include files happen before the login shell
+// starts, not inside it. The profile runs first, in the directory it starts in,
+// and a profile can branch on the mirror's contents (load placeholder config
+// only when config/application.yml is absent, say). Started from $HOME, it
+// would never see the mirror; started before the removal, it would see an
+// include file a previous --include run left behind.
 func RunScript(r Run) string {
-	var inner strings.Builder
+	var outer, inner strings.Builder
 
 	// QuotePath, not Quote: the mirror path carries the host's ~.
-	fmt.Fprintf(&inner, "cd %s || exit 1\n", remote.QuotePath(r.Path))
+	cd := fmt.Sprintf("cd %s || exit 1\n", remote.QuotePath(r.Path))
+	outer.WriteString(cd)
+	if len(r.Remove) > 0 {
+		fmt.Fprintf(&outer, "rm -f -- %s\n", remote.QuoteAll(r.Remove))
+	}
+	// Again inside, in case the profile changes directory.
+	inner.WriteString(cd)
 
 	for _, k := range sortedKeys(r.Env) {
 		fmt.Fprintf(&inner, "export %s=%s\n", k, remote.Quote(r.Env[k]))
@@ -284,7 +301,7 @@ func RunScript(r Run) string {
 	// exec so the command owns the exit status and signals directly.
 	fmt.Fprintf(&inner, "exec %s", remote.QuoteAll(r.Cmd))
 
-	return "${SHELL:-/bin/sh} -lc " + remote.Quote(inner.String())
+	return outer.String() + "exec ${SHELL:-/bin/sh} -lc " + remote.Quote(inner.String())
 }
 
 // writeLock emits a blocking flock held on a file descriptor.
