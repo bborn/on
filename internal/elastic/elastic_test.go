@@ -10,10 +10,13 @@ import (
 	"github.com/bborn/on/internal/inventory"
 )
 
+var hetznerCfg = inventory.ProviderConfig{Locations: []string{"fsn1", "nbg1"}, SSHKeys: []string{"k"}}
+
 var pool = inventory.Pool{
-	Name: "ol", Provider: "hetzner", Image: "offerlab", User: "dev", Workdir: "~/worktrees",
-	Types: []string{"cx53", "cpx62"}, Locations: []string{"fsn1", "nbg1"},
-	SSHKeys: []string{"k"}, IdleMinutes: 20, MaxHours: 12, MaxServers: 2,
+	Name: "ol", Image: "offerlab", User: "dev", Workdir: "~/worktrees",
+	MinCPUs: 8, MinMemoryGB: 30, Currency: "EUR", Rates: map[string]float64{"USD": 0.5},
+	Providers:   map[string]inventory.ProviderConfig{"hetzner": hetznerCfg},
+	IdleMinutes: 20, MaxHours: 12, MaxServers: 2,
 }
 
 func TestDecide(t *testing.T) {
@@ -100,40 +103,88 @@ func (f *fake) run(args ...string) ([]byte, error) {
 	return f.respond(args)
 }
 
-const snapshotJSON = `[{"id":7,"created":"2026-09-24T10:00:00Z","labels":{"on-image":"offerlab"}}]`
+const snapshotJSON = `[{"id":7,"created":"2026-09-24T10:00:00Z","disk_size":160,"labels":{"on-image":"offerlab"}}]`
 
-func TestCreateFallsBackAcrossTypesAndLocations(t *testing.T) {
-	f := &fake{respond: func(args []string) ([]byte, error) {
+// Prices as hcloud lists them. cx53 is cheapest, then cpx62; cx33 is too small
+// for the pool, cax41 is Arm, and ccx13's disk is smaller than the snapshot's.
+const typesJSON = `[
+ {"name":"cpx62","cores":16,"memory":32,"disk":640,"architecture":"x86","deprecated":false,"deprecation":null,
+  "prices":[{"location":"fsn1","price_hourly":{"gross":"0.2452"}},{"location":"nbg1","price_hourly":{"gross":"0.2452"}},{"location":"sin","price_hourly":{"gross":"0.3"}}]},
+ {"name":"cx53","cores":16,"memory":32,"disk":320,"architecture":"x86","deprecated":false,"deprecation":null,
+  "prices":[{"location":"fsn1","price_hourly":{"gross":"0.0561"}},{"location":"nbg1","price_hourly":{"gross":"0.0561"}}]},
+ {"name":"cx33","cores":4,"memory":8,"disk":80,"architecture":"x86","deprecated":false,"deprecation":null,
+  "prices":[{"location":"fsn1","price_hourly":{"gross":"0.016"}}]},
+ {"name":"cax41","cores":16,"memory":32,"disk":320,"architecture":"arm","deprecated":false,"deprecation":null,
+  "prices":[{"location":"fsn1","price_hourly":{"gross":"0.03"}}]},
+ {"name":"ccx13","cores":16,"memory":32,"disk":80,"architecture":"x86","deprecated":false,"deprecation":null,
+  "prices":[{"location":"fsn1","price_hourly":{"gross":"0.02"}}]}
+]`
+
+func hetznerFake(create func(joined string) ([]byte, error)) *fake {
+	return &fake{respond: func(args []string) ([]byte, error) {
 		switch args[0] {
 		case "image":
 			return []byte(snapshotJSON), nil
+		case "server-type":
+			return []byte(typesJSON), nil
 		case "server":
-			joined := strings.Join(args, " ")
-			if strings.Contains(joined, "--type cpx62 --location nbg1") {
-				return []byte(`{"server":{"id":1,"name":"on-ol-x","status":"initializing",
-					"public_net":{"ipv4":{"ip":"1.2.3.4"}},"server_type":{"name":"cpx62"},
-					"datacenter":{"location":{"name":"nbg1"}},"labels":{"on-pool":"ol"}}}`), nil
-			}
-			return []byte("resource_unavailable"), errors.New("error during placement (resource_unavailable)")
+			return create(strings.Join(args, " "))
 		}
 		return nil, errors.New("unexpected")
 	}}
-	h := &Hetzner{Pool: pool, Run: f.run}
-	s, err := h.Create(time.Now())
+}
+
+func hetznerManager(f *fake) *Manager {
+	h := NewHetzner(pool, hetznerCfg)
+	h.Run = f.run
+	return &Manager{Pool: pool, Providers: []Provider{h}}
+}
+
+func TestHetznerOffersOnlyWhatCanBootTheImage(t *testing.T) {
+	m := hetznerManager(hetznerFake(nil))
+	offers, err := m.Offers(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Type != "cpx62" || s.Location != "nbg1" || s.IP != "1.2.3.4" {
+	var got []string
+	for _, o := range offers {
+		got = append(got, o.Type+"@"+o.Location)
+	}
+	want := "cx53@fsn1 cx53@nbg1 cpx62@fsn1 cpx62@nbg1"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("offers = %v, want %s (cheapest first, configured locations only, no Arm, no small disk, none under the minimum)", got, want)
+	}
+}
+
+func TestCreateFallsBackToTheNextCheapest(t *testing.T) {
+	f := hetznerFake(func(joined string) ([]byte, error) {
+		if strings.Contains(joined, "--type cpx62 --location nbg1") {
+			return []byte(`{"server":{"id":1,"name":"on-ol-x","status":"initializing",
+				"public_net":{"ipv4":{"ip":"1.2.3.4"}},"server_type":{"name":"cpx62"},
+				"datacenter":{"location":{"name":"nbg1"}},"labels":{"on-pool":"ol"}}}`), nil
+		}
+		return []byte("resource_unavailable"), errors.New("error during placement (resource_unavailable)")
+	})
+	s, err := hetznerManager(f).Create(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Provider != "hetzner" || s.Type != "cpx62" || s.Location != "nbg1" || s.IP != "1.2.3.4" {
 		t.Fatalf("got %+v", s)
 	}
-	// cx53@fsn1, cx53@nbg1, cpx62@fsn1 fail before cpx62@nbg1 succeeds.
-	if n := len(f.calls); n != 5 {
-		t.Fatalf("expected 1 image lookup + 4 create attempts, got %d calls", n)
+	var creates []string
+	for _, c := range f.calls {
+		if c[0] == "server" && c[1] == "create" {
+			creates = append(creates, strings.Join(c, " "))
+		}
 	}
-	create := strings.Join(f.calls[4], " ")
+	// cx53@fsn1, cx53@nbg1 and cpx62@fsn1 are sold out before cpx62@nbg1 works.
+	if len(creates) != 4 {
+		t.Fatalf("expected 4 create attempts, got %d", len(creates))
+	}
 	for _, want := range []string{"--image 7", "--label on=elastic", "--label on-pool=ol", "--ssh-key k"} {
-		if !strings.Contains(create, want) {
-			t.Errorf("create call missing %q: %s", want, create)
+		if !strings.Contains(creates[3], want) {
+			t.Errorf("create call missing %q: %s", want, creates[3])
 		}
 	}
 }
@@ -143,8 +194,7 @@ func TestCreateRefusesWhilePausedToday(t *testing.T) {
 	f := &fake{respond: func(args []string) ([]byte, error) {
 		return []byte(`[{"id":7,"created":"2026-09-24T10:00:00Z","labels":{"on-image":"offerlab","on-paused":"2026-09-24"}}]`), nil
 	}}
-	h := &Hetzner{Pool: pool, Run: f.run}
-	if _, err := h.Create(now); !errors.Is(err, ErrPaused) {
+	if _, err := hetznerManager(f).Create(now); !errors.Is(err, ErrPaused) {
 		t.Fatalf("want ErrPaused, got %v", err)
 	}
 	if len(f.calls) != 1 {
@@ -161,7 +211,8 @@ func TestListScopesToThePoolAndParses(t *testing.T) {
 			"labels":{"on-pool":"ol"},"public_net":{"ipv4":{"ip":"1.2.3.4"}},
 			"server_type":{"name":"cx53"},"location":{"name":"nbg1"},"datacenter":null}]`), nil
 	}}
-	h := &Hetzner{Pool: pool, Run: f.run}
+	h := NewHetzner(pool, hetznerCfg)
+	h.Run = f.run
 	servers, err := h.List()
 	if err != nil {
 		t.Fatal(err)

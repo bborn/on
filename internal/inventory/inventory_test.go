@@ -230,3 +230,65 @@ func TestLoadPoolValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadPoolWithSeveralProviders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hosts.yaml")
+	os.WriteFile(path, []byte(`
+elastic:
+  cloud:
+    image: offerlab
+    min_cpus: 8
+    min_memory_gb: 30
+    rates: {USD: 0.86}
+    serves: [offerlab]
+    providers:
+      hetzner: {context: dev, locations: [fsn1]}
+      digitalocean: {token_file: ~/do.env, locations: [nyc3, sfo3], ssh_keys: [k]}
+`), 0o600)
+	inv, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := inv.Elastic["cloud"]
+	if got := p.ProviderNames(); len(got) != 2 || got[0] != "digitalocean" || got[1] != "hetzner" {
+		t.Fatalf("providers = %v", got)
+	}
+	if p.Currency != "EUR" {
+		t.Fatalf("currency should default to EUR, got %q", p.Currency)
+	}
+	if r, ok := p.Rate("USD"); !ok || r != 0.86 {
+		t.Fatalf("USD rate = %v, %v", r, ok)
+	}
+	if r, ok := p.Rate("EUR"); !ok || r != 1 {
+		t.Fatalf("the pool's own currency converts at 1, got %v, %v", r, ok)
+	}
+}
+
+func TestLoadPoolFoldsTheSingleProviderForm(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hosts.yaml")
+	os.WriteFile(path, []byte("elastic:\n  p:\n    provider: hetzner\n    context: dev\n    image: x\n    types: [cx53]\n    locations: [fsn1]\n    ssh_keys: [k]\n"), 0o600)
+	inv, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, ok := inv.Elastic["p"].Providers["hetzner"]
+	if !ok || h.Context != "dev" || h.Types[0] != "cx53" || h.Locations[0] != "fsn1" || h.SSHKeys[0] != "k" {
+		t.Fatalf("single-provider fields not folded: %+v", inv.Elastic["p"].Providers)
+	}
+}
+
+func TestLoadPoolNeedsARateForAForeignCurrency(t *testing.T) {
+	for name, body := range map[string]string{
+		"no rate for USD":    "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      digitalocean: {locations: [nyc3]}\n",
+		"no locations":       "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      hetzner: {context: c}\n",
+		"no size or types":   "elastic:\n  p:\n    image: x\n    providers:\n      hetzner: {locations: [fsn1]}\n",
+		"unknown provider":   "elastic:\n  p:\n    image: x\n    min_memory_gb: 30\n    providers:\n      aws: {locations: [us-east-1]}\n",
+		"provider both ways": "elastic:\n  p:\n    provider: hetzner\n    image: x\n    types: [a]\n    locations: [b]\n    providers:\n      hetzner: {locations: [b]}\n",
+	} {
+		path := filepath.Join(t.TempDir(), "hosts.yaml")
+		os.WriteFile(path, []byte(body), 0o600)
+		if _, err := Load(path); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}

@@ -181,7 +181,7 @@ exec:
 ```
 
 ```
-on exec --include hetzner bin/dev     # a dev server that needs the real config
+on exec --include cloud bin/dev       # a dev server that needs the real config
 ```
 
 Each file is read from the tree you are standing in, following a symlink to what
@@ -222,53 +222,90 @@ Point an agent at it from `CLAUDE.md` or `AGENTS.md`:
 Fixed hosts are the cheap default. When none of them has room, `on exec` can boot
 a server from a snapshot, run there, and let it be deleted once it sits idle.
 
+A pool says how big a server it needs, not which one. Every provider it lists
+reports what it could boot: each type, in each location, that can boot the pool's
+image. `on` converts the prices to one currency and tries them cheapest first. A
+sold-out type fails fast and the next cheapest is tried, so a stock-out on one
+provider falls through to another instead of failing the run.
+
 ```yaml
 elastic:
-  hetzner:
-    provider: hetzner          # the only provider; driven through the hcloud CLI
-    context: myproject         # hcloud context, so the token never lives in this file
-    image: myapp               # boots the newest snapshot labelled on-image=myapp
-    types: [cx53, cpx62]       # tried in order across locations: capacity comes and goes
-    locations: [fsn1, nbg1]
-    ssh_keys: [laptop, reaper] # hcloud ssh-key names installed on each server
+  cloud:
+    image: myapp               # boots the newest snapshot labelled (tagged) on-image=myapp
+    build: ~/images/myapp.sh   # provisions a fresh server into the image; see below
+    min_cpus: 8                # the smallest server the pool will boot
+    min_memory_gb: 30
+    currency: EUR              # of daily_budget and the ledger (default EUR)
+    rates: {USD: 0.86}         # converts other providers' prices; value of 1 USD in EUR
+    providers:
+      hetzner:
+        context: myproject     # hcloud context, so the token never lives in this file
+        locations: [fsn1, nbg1]
+        ssh_keys: [laptop, reaper]
+      digitalocean:
+        token_file: ~/.config/on/digitalocean.env   # DIGITALOCEAN_ACCESS_TOKEN=…
+        locations: [nyc3, sfo3]
+        ssh_keys: [laptop, reaper]
+        # types: [s-8vcpu-32gb]  # optional: only these, instead of any big enough
     user: dev                  # the login baked into the image
     serves: [myapp]
     min_free_mb: 8000          # below this on every fixed host, use the pool
     idle_minutes: 20           # `on reap` deletes a server unused this long
     max_hours: 12              # and any server this old, busy or not
-    max_servers: 2
-    daily_budget: 5            # per UTC day, in the project's billing currency
+    max_servers: 2             # across providers
+    daily_budget: 5            # per UTC day, in currency
 ```
 
+Equal prices go to the location listed first. Hetzner is driven through the
+hcloud CLI; DigitalOcean through its API, with the token read from `token_file`
+(or `DIGITALOCEAN_ACCESS_TOKEN`). A pool written before providers existed
+(`provider: hetzner` with `types`, `locations` and `ssh_keys` at the top level)
+still loads.
+
 ```
-on exec hetzner bin/rails test    # force the pool
-on up hetzner                     # start a server now, e.g. for a dev server
-on forward hetzner 3000           # http://localhost:3000 is the server's port 3000
-on pools                          # servers, prices, today's spend
-on down on-hetzner-3fa2c1         # delete now
+on offers cloud                   # what the next server would be, cheapest first
+on exec cloud bin/rails test      # force the pool
+on up cloud                       # start a server now, e.g. for a dev server
+on forward cloud 3000             # http://localhost:3000 is the server's port 3000
+on pools                          # servers, providers, prices, today's spend
+on down on-cloud-3fa2c1           # delete now
 on reap                           # run every few minutes on an always-on machine
+on image build cloud digitalocean # build the pool's image on a provider
 ```
+
+**Images are built per provider.** A snapshot cannot move between clouds, so each
+provider keeps its own. `on image build <pool> <provider>` boots the cheapest
+plain Ubuntu 24.04 server of at least 4 CPU / 8 GB there, runs the pool's `build`
+script with the server's IP as its argument (it logs in as root), snapshots the
+result, deletes older snapshots, and deletes the server, even if the build
+fails (`--keep` leaves it for debugging). The builder is kept small because its
+disk becomes the image's minimum disk. On DigitalOcean the snapshot is also
+copied to the pool's other regions, since a droplet can only boot from a
+snapshot in its own region; until a copy finishes, that region is not offered.
 
 **Servers resolve as ssh aliases.** `on` writes one `Host` block per server to
 `~/.config/on/ssh_config.d/<pool>.conf`; add
 `Include ~/.config/on/ssh_config.d/*.conf` near the top of `~/.ssh/config`.
 
-**Deleted, never stopped.** Hetzner bills a powered-off server, so idle servers are
-deleted. `on reap` counts a server as busy while a tmux session exists or any
-process has its working directory under the workdir (where `on exec` mirrors and
-`on forward` keepalives live — a keepalive ends with its tunnel), which protects it from the idle rule but not from
-`max_hours` or the budget.
+**Deleted, never stopped.** Both providers bill a powered-off server, so idle
+servers are deleted. `on reap` counts a server as busy while a tmux session exists
+or any process has its working directory under the workdir (where `on exec`
+mirrors and `on forward` keepalives live — a keepalive ends with its tunnel),
+which protects it from the idle rule but not from `max_hours` or the budget.
 
 **The budget is enforced in two places.** `on reap` estimates spend per started
-hour in a ledger (`~/.local/state/on/ledger.json`). Once a pool reaches its
-`daily_budget` it deletes the pool's servers and labels the snapshot
+hour in a ledger (`~/.local/state/on/ledger.json`); for a provider that bills by
+the second that overstates, which is the safe side for a cap. Once a pool reaches
+its `daily_budget` it deletes the pool's servers and marks every provider's image
 `on-paused=<day>`, which stops `on exec` on every machine from starting another
 until the next UTC day. Without a machine running `on reap` on a schedule, idle
 servers are never deleted, so set that up first.
 
-**Everything is labelled.** Servers carry `on=elastic` and `on-pool=<pool>`, and
-`on` only ever lists or deletes servers with both, so a pool can share a project
-with servers `on` did not create.
+**Everything is labelled.** Servers carry `on=elastic` and `on-pool=<pool>`
+(DigitalOcean tags `on:elastic` and `on-pool:<pool>`), and `on` only ever lists or
+deletes servers with both, so a pool can share an account with servers `on` did
+not create. A provider that cannot be reached is reported and skipped, so it
+cannot hide the others' servers from `on reap`.
 
 ## Knowing where you are
 
