@@ -55,6 +55,106 @@ type Inventory struct {
 
 	// Exec holds per-project settings for `on exec`.
 	Exec map[string]ExecConfig `yaml:"exec"`
+
+	// Elastic holds pools of on-demand hosts, keyed by pool name.
+	Elastic map[string]Pool `yaml:"elastic"`
+}
+
+// Pool is a set of on-demand hosts `on` creates from a snapshot when the fixed
+// hosts are short of memory, and deletes again once they sit idle.
+//
+// Only Hetzner is supported. `on` drives the hcloud CLI, so the API token lives in
+// an hcloud context rather than in this file, and anything hcloud can do by hand
+// stays possible alongside `on`.
+type Pool struct {
+	// Name is the inventory key, filled in during load.
+	Name string `yaml:"-"`
+
+	// Provider is "hetzner".
+	Provider string `yaml:"provider"`
+
+	// Context is the hcloud CLI context whose project holds the servers.
+	Context string `yaml:"context"`
+
+	// Image is the snapshot to boot, matched by its `on-image` label; the newest wins.
+	Image string `yaml:"image"`
+
+	// Types and Locations are tried in order until one has capacity. Hetzner
+	// regularly runs out of a type in one location, so a single choice is not
+	// enough to rely on.
+	Types     []string `yaml:"types"`
+	Locations []string `yaml:"locations"`
+
+	// SSHKeys are hcloud ssh-key names installed on each server.
+	SSHKeys []string `yaml:"ssh_keys"`
+
+	// User is the login baked into the image. Defaults to "dev".
+	User string `yaml:"user"`
+
+	// Workdir is where mirrors live on the server. Defaults to DefaultWorkdir.
+	Workdir string `yaml:"workdir"`
+
+	Capabilities []string `yaml:"capabilities"`
+
+	// Serves lists the projects this pool can run through `on exec`.
+	Serves []string `yaml:"serves"`
+
+	// MinFreeMB is the memory a fixed host must have available for `on exec` to
+	// stay on it. Below that on every fixed host, the run goes to this pool.
+	MinFreeMB int `yaml:"min_free_mb"`
+
+	// IdleMinutes is how long a server may go unused before `on reap` deletes it.
+	IdleMinutes int `yaml:"idle_minutes"`
+
+	// MaxHours deletes a server this old even if busy: a forgotten dev server
+	// should not run all week.
+	MaxHours int `yaml:"max_hours"`
+
+	// MaxServers caps how many servers the pool runs at once.
+	MaxServers int `yaml:"max_servers"`
+
+	// DailyBudget caps what the pool may spend per UTC day, in the project's
+	// billing currency. Reaching it stops new servers and deletes running ones.
+	DailyBudget float64 `yaml:"daily_budget"`
+}
+
+// Pool defaults, applied at load.
+const (
+	DefaultPoolUser        = "dev"
+	DefaultPoolIdleMinutes = 20
+	DefaultPoolMaxHours    = 12
+	DefaultPoolMaxServers  = 2
+	DefaultPoolMinFreeMB   = 6000
+)
+
+// ServesProject reports whether the pool can run the project.
+func (p Pool) ServesProject(project string) bool {
+	for _, s := range p.Serves {
+		if s == project {
+			return true
+		}
+	}
+	return false
+}
+
+// PoolFor returns the first pool (in name order) that serves the project.
+func (inv *Inventory) PoolFor(project string) (Pool, bool) {
+	for _, n := range inv.PoolNames() {
+		if p := inv.Elastic[n]; p.ServesProject(project) {
+			return p, true
+		}
+	}
+	return Pool{}, false
+}
+
+// PoolNames returns pool names in stable order.
+func (inv *Inventory) PoolNames() []string {
+	names := make([]string, 0, len(inv.Elastic))
+	for n := range inv.Elastic {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // ExecConfig is how a project prepares itself on a remote host.
@@ -206,7 +306,7 @@ func Load(path string) (*Inventory, error) {
 	if err := yaml.Unmarshal(raw, &inv); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	if len(inv.Hosts) == 0 {
+	if len(inv.Hosts) == 0 && len(inv.Elastic) == 0 {
 		return nil, fmt.Errorf("%s declares no hosts", path)
 	}
 
@@ -219,6 +319,38 @@ func Load(path string) (*Inventory, error) {
 			h.Workdir = DefaultWorkdir
 		}
 		inv.Hosts[name] = h
+	}
+
+	for name, p := range inv.Elastic {
+		if _, clash := inv.Hosts[name]; clash {
+			return nil, fmt.Errorf("pool %q has the same name as a host", name)
+		}
+		if p.Provider != "hetzner" {
+			return nil, fmt.Errorf("pool %q: provider must be \"hetzner\", got %q", name, p.Provider)
+		}
+		if p.Image == "" || len(p.Types) == 0 || len(p.Locations) == 0 {
+			return nil, fmt.Errorf("pool %q needs image, types and locations", name)
+		}
+		p.Name = name
+		if p.User == "" {
+			p.User = DefaultPoolUser
+		}
+		if p.Workdir == "" {
+			p.Workdir = DefaultWorkdir
+		}
+		if p.IdleMinutes <= 0 {
+			p.IdleMinutes = DefaultPoolIdleMinutes
+		}
+		if p.MaxHours <= 0 {
+			p.MaxHours = DefaultPoolMaxHours
+		}
+		if p.MaxServers <= 0 {
+			p.MaxServers = DefaultPoolMaxServers
+		}
+		if p.MinFreeMB <= 0 {
+			p.MinFreeMB = DefaultPoolMinFreeMB
+		}
+		inv.Elastic[name] = p
 	}
 	return &inv, nil
 }

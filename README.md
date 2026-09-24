@@ -194,6 +194,59 @@ Point an agent at it from `CLAUDE.md` or `AGENTS.md`:
 
 > Run tests with `on exec bin/rails test`, never `bin/rails test`.
 
+## Elastic pools
+
+Fixed hosts are the cheap default. When none of them has room, `on exec` can boot
+a server from a snapshot, run there, and let it be deleted once it sits idle.
+
+```yaml
+elastic:
+  hetzner:
+    provider: hetzner          # the only provider; driven through the hcloud CLI
+    context: myproject         # hcloud context, so the token never lives in this file
+    image: myapp               # boots the newest snapshot labelled on-image=myapp
+    types: [cx53, cpx62]       # tried in order across locations: capacity comes and goes
+    locations: [fsn1, nbg1]
+    ssh_keys: [laptop, reaper] # hcloud ssh-key names installed on each server
+    user: dev                  # the login baked into the image
+    serves: [myapp]
+    min_free_mb: 8000          # below this on every fixed host, use the pool
+    idle_minutes: 20           # `on reap` deletes a server unused this long
+    max_hours: 12              # and any server this old, busy or not
+    max_servers: 2
+    daily_budget: 5            # per UTC day, in the project's billing currency
+```
+
+```
+on exec hetzner bin/rails test    # force the pool
+on up hetzner                     # start a server now, e.g. for a dev server
+on forward hetzner 3000           # http://localhost:3000 is the server's port 3000
+on pools                          # servers, prices, today's spend
+on down on-hetzner-3fa2c1         # delete now
+on reap                           # run every few minutes on an always-on machine
+```
+
+**Servers resolve as ssh aliases.** `on` writes one `Host` block per server to
+`~/.config/on/ssh_config.d/<pool>.conf`; add
+`Include ~/.config/on/ssh_config.d/*.conf` near the top of `~/.ssh/config`.
+
+**Deleted, never stopped.** Hetzner bills a powered-off server, so idle servers are
+deleted. `on reap` counts a server as busy while a tmux session exists or any
+process has its working directory under the workdir (where `on exec` mirrors and
+`on forward` keepalives live — a keepalive ends with its tunnel), which protects it from the idle rule but not from
+`max_hours` or the budget.
+
+**The budget is enforced in two places.** `on reap` estimates spend per started
+hour in a ledger (`~/.local/state/on/ledger.json`). Once a pool reaches its
+`daily_budget` it deletes the pool's servers and labels the snapshot
+`on-paused=<day>`, which stops `on exec` on every machine from starting another
+until the next UTC day. Without a machine running `on reap` on a schedule, idle
+servers are never deleted, so set that up first.
+
+**Everything is labelled.** Servers carry `on=elastic` and `on-pool=<pool>`, and
+`on` only ever lists or deletes servers with both, so a pool can share a project
+with servers `on` did not create.
+
 ## Knowing where you are
 
 With `--repo` the host is chosen for you, so `on` prints the target before
