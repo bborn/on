@@ -188,3 +188,45 @@ hosts:
 		t.Errorf("ProjectNames = %v, want sorted [only-b shared]", names)
 	}
 }
+
+func TestLoadPools(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hosts.yaml")
+	os.WriteFile(path, []byte(`
+elastic:
+  ol:
+    provider: hetzner
+    context: dev
+    image: offerlab
+    types: [cx53]
+    locations: [fsn1]
+    serves: [offerlab]
+`), 0o600)
+	inv, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, ok := inv.PoolFor("offerlab")
+	if !ok || p.Name != "ol" {
+		t.Fatalf("PoolFor = %+v, %v", p, ok)
+	}
+	if p.User != DefaultPoolUser || p.IdleMinutes != DefaultPoolIdleMinutes || p.MaxServers != DefaultPoolMaxServers {
+		t.Fatalf("defaults not applied: %+v", p)
+	}
+	if _, ok := inv.PoolFor("other"); ok {
+		t.Fatal("pool must only serve its listed projects")
+	}
+}
+
+func TestLoadPoolValidation(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown provider": "elastic:\n  p:\n    provider: aws\n    image: x\n    types: [a]\n    locations: [b]\n",
+		"missing image":    "elastic:\n  p:\n    provider: hetzner\n    types: [a]\n    locations: [b]\n",
+		"name clash":       "hosts:\n  p:\n    ssh: p\nelastic:\n  p:\n    provider: hetzner\n    image: x\n    types: [a]\n    locations: [b]\n",
+	} {
+		path := filepath.Join(t.TempDir(), "hosts.yaml")
+		os.WriteFile(path, []byte(body), 0o600)
+		if _, err := Load(path); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}

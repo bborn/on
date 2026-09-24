@@ -29,11 +29,19 @@ const usage = `on — run work on another machine, interactively.
 usage:
   on [flags] <host> <command>...   run <command> on <host> in a tmux session, and attach
   on exec [--repo <p>] <command>   sync this directory to a host and run there
+  on exec <pool> <command>         the same, on a server from an elastic pool
+  on forward <host|pool> <port>    reach a remote port (e.g. a dev server) on localhost
   on ls                            list hosts with load and free memory
   on ps                            list live sessions across the fleet
   on attach <host> [name]          reattach to a session
   on kill <host> <name>            end a session
   on init                          write a starter inventory
+
+elastic pools (on-demand servers booted from a snapshot, deleted when idle):
+  on pools [--json]                servers, prices and today's spend per pool
+  on up <pool>                     start a server now
+  on down <server>... | --pool <p> delete servers now
+  on reap [--dry-run]              delete idle/over-age/over-budget servers (cron)
 
 flags (before or just after <host>):
   -C <dir>      remote working directory
@@ -78,6 +86,16 @@ func run(args []string) error {
 		return cmdKill(args[1:])
 	case "exec":
 		return cmdExec(args[1:])
+	case "pools":
+		return cmdPools(args[1:])
+	case "up":
+		return cmdUp(args[1:])
+	case "down":
+		return cmdDown(args[1:])
+	case "reap":
+		return cmdReap(args[1:])
+	case "forward":
+		return cmdForward(args[1:])
 	case "completion":
 		return cmdCompletion(args[1:])
 
@@ -712,9 +730,21 @@ func cmdExec(args []string) error {
 	// An explicit host wins; otherwise infer the project from the checkout we are
 	// standing in, so `on exec bin/rails test` needs no arguments at all.
 	var host inventory.Host
+	done := func() {}
 	cmd := rest
 	if h, ok := inv.Hosts[rest[0]]; ok {
 		host, cmd = h, rest[1:]
+		after, remainder, ferr := parseFlags(cmd)
+		if ferr != nil {
+			return ferr
+		}
+		o, cmd = merge(o, after), remainder
+	} else if pool, ok := inv.Elastic[rest[0]]; ok {
+		p, err := acquire(pool, false)
+		if err != nil {
+			return err
+		}
+		host, done, cmd = p.host, p.done, rest[1:]
 		after, remainder, ferr := parseFlags(cmd)
 		if ferr != nil {
 			return ferr
@@ -733,9 +763,11 @@ func cmdExec(args []string) error {
 		if repo == "" {
 			return fmt.Errorf("could not tell which project %s belongs to — pass --repo or a host", local)
 		}
-		if host, err = pickHostFor(inv, repo); err != nil {
+		p, err := placeForExec(inv, repo)
+		if err != nil {
 			return err
 		}
+		host, done = p.host, p.done
 	}
 
 	remotePath := mirror.Path(host.Workdir, local)
@@ -771,7 +803,9 @@ func cmdExec(args []string) error {
 
 	ssh := exec.Command(argv[0], argv[1:]...)
 	ssh.Stdin, ssh.Stdout, ssh.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := ssh.Run(); err != nil {
+	err = ssh.Run()
+	done()
+	if err != nil {
 		// Propagate the remote exit code, so a failing test suite fails the
 		// caller exactly as a local run would.
 		if ee, ok := err.(*exec.ExitError); ok {
