@@ -239,6 +239,10 @@ type Run struct {
 	// prepare and the command. Empty means no lock.
 	Lock string
 
+	// Remove lists paths, relative to the mirror, deleted before anything runs:
+	// include files a previous --include run left that this run must not see.
+	Remove []string
+
 	// Cmd is the command itself.
 	Cmd []string
 }
@@ -267,6 +271,9 @@ func RunScript(r Run) string {
 
 	// QuotePath, not Quote: the mirror path carries the host's ~.
 	fmt.Fprintf(&inner, "cd %s || exit 1\n", remote.QuotePath(r.Path))
+	if len(r.Remove) > 0 {
+		fmt.Fprintf(&inner, "rm -f -- %s\n", remote.QuoteAll(r.Remove))
+	}
 
 	for _, k := range sortedKeys(r.Env) {
 		fmt.Fprintf(&inner, "export %s=%s\n", k, remote.Quote(r.Env[k]))

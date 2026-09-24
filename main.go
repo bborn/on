@@ -30,6 +30,7 @@ usage:
   on [flags] <host> <command>...   run <command> on <host> in a tmux session, and attach
   on exec [--repo <p>] <command>   sync this directory to a host and run there
   on exec <pool> <command>         the same, on a server from an elastic pool
+  on exec --include <command>      also sync the project's include files (e.g. for a dev server)
   on forward <host|pool> <port>    reach a remote port (e.g. a dev server) on localhost
   on ls                            list hosts with load and free memory
   on ps                            list live sessions across the fleet
@@ -114,11 +115,12 @@ func run(args []string) error {
 // so that everything after it passes through to the remote command untouched —
 // `on devbox claude --resume` must send --resume to claude, not to on.
 type opts struct {
-	dir    string
-	repo   string
-	name   string
-	detach bool
-	fresh  bool
+	dir     string
+	repo    string
+	name    string
+	detach  bool
+	fresh   bool
+	include bool
 }
 
 // parseFlags consumes leading flags and returns the remainder.
@@ -163,6 +165,9 @@ func parseFlags(args []string) (opts, []string, error) {
 			i++
 		case "--new":
 			o.fresh = true
+			i++
+		case "--include", "-i":
+			o.include = true
 			i++
 		default:
 			return o, nil, fmt.Errorf("unknown flag %q (flags go before or just after the host)", args[i])
@@ -700,6 +705,9 @@ func merge(before, after opts) opts {
 	if after.fresh {
 		before.fresh = true
 	}
+	if after.include {
+		before.include = true
+	}
 	return before
 }
 
@@ -782,6 +790,17 @@ func cmdExec(args []string) error {
 	if err := rs.Run(); err != nil {
 		return fmt.Errorf("sync to %s failed: %w", host.Name, err)
 	}
+	// Include files are for runs that need the app's local config, such as a dev
+	// server. Other runs remove them first, so a test run in the same mirror
+	// never inherits keys CI would not have.
+	var remove []string
+	if o.include {
+		if err := syncIncludes(host, local, remotePath, cfg.Include); err != nil {
+			return err
+		}
+	} else {
+		remove = cfg.Include
+	}
 
 	run := mirror.Run{
 		Path:          remotePath,
@@ -789,6 +808,7 @@ func cmdExec(args []string) error {
 		Setup:         cfg.Setup,
 		Prepare:       cfg.Prepare,
 		PrepareInputs: cfg.PrepareInputs,
+		Remove:        remove,
 		Cmd:           cmd,
 	}
 	if cfg.Prepare != "" {
@@ -852,4 +872,30 @@ func normalizeGitURL(u string) string {
 func isTerminal() bool {
 	fi, err := os.Stdout.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// syncIncludes puts the project's include files (gitignored config the app needs)
+// into the mirror, after the main sync has skipped them.
+func syncIncludes(host inventory.Host, local, remotePath string, includes []string) error {
+	if len(includes) == 0 {
+		return nil
+	}
+	dir, staged, missing, err := mirror.StageIncludes(local, mirror.MainCheckout(local), includes)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "  include not found here or in the main checkout: %s\n", strings.Join(missing, ", "))
+	}
+	if len(staged) == 0 {
+		return nil
+	}
+	args := mirror.IncludeRsyncArgs(host.SSH, dir, remotePath)
+	rs := exec.Command(args[0], args[1:]...)
+	rs.Stdout, rs.Stderr = os.Stderr, os.Stderr
+	if err := rs.Run(); err != nil {
+		return fmt.Errorf("syncing include files to %s failed: %w", host.Name, err)
+	}
+	return nil
 }
