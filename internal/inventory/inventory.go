@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bborn/on/internal/mirror"
 	"gopkg.in/yaml.v3"
 )
 
@@ -200,6 +201,13 @@ type ExecConfig struct {
 	// failures — a red suite with no regression behind it.
 	Env map[string]string `yaml:"env"`
 
+	// Include lists gitignored files to sync anyway, relative to the tree: the
+	// secrets and local config an app will not boot without, such as
+	// config/application.yml. Symlinks are followed, and a file the tree lacks is
+	// taken from the repository's main checkout, the way worktree setup scripts
+	// link them. They land 0600 and are left in place by later syncs.
+	Include []string `yaml:"include"`
+
 	// Lock serialises runs that share this name on a host. Empty means no lock.
 	//
 	// Mirrors are isolated from each other, but the things they talk to are not:
@@ -319,6 +327,14 @@ func Load(path string) (*Inventory, error) {
 			h.Workdir = DefaultWorkdir
 		}
 		inv.Hosts[name] = h
+	}
+
+	for project, e := range inv.Exec {
+		for _, inc := range e.Include {
+			if why := mirror.ValidInclude(inc); why != "" {
+				return nil, fmt.Errorf("exec.%s.include: %q %s", project, inc, why)
+			}
+		}
 	}
 
 	for name, p := range inv.Elastic {

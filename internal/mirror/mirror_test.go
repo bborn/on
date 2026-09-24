@@ -525,3 +525,17 @@ func TestLockSerialisesConcurrentRuns(t *testing.T) {
 		t.Errorf("runs overlapped: got %q, want %q", got, want)
 	}
 }
+
+func TestRunScriptRemovesIncludesFirst(t *testing.T) {
+	script := RunScript(Run{Path: "~/m", Remove: []string{"config/application.yml", ".env"}, Cmd: []string{"bin/rails", "test"}})
+	rm := strings.Index(script, "rm -f -- config/application.yml .env")
+	if rm < 0 {
+		t.Fatalf("missing removal:\n%s", script)
+	}
+	if run := strings.Index(script, "exec bin/rails test"); run < rm {
+		t.Fatalf("removal must come before the command:\n%s", script)
+	}
+	if strings.Contains(RunScript(Run{Path: "~/m", Cmd: []string{"x"}}), "rm -f") {
+		t.Fatal("no Remove, no rm")
+	}
+}

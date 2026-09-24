@@ -168,6 +168,29 @@ one-off bootstrap and wrong for anything derived from source you are editing. A
 failing `prepare` aborts the run rather than letting the command proceed without
 what it needs.
 
+### Files the sync leaves out
+
+The sync skips anything gitignored, which includes the local config an app needs
+to boot for real, such as `config/application.yml`. List those per project and
+ask for them with `--include`:
+
+```yaml
+exec:
+  myapp:
+    include: [config/application.yml, config/master.key, .env]
+```
+
+```
+on exec --include hetzner bin/dev     # a dev server that needs the real config
+```
+
+Each file is read from the tree you are standing in, following a symlink to what
+it points at. A file the tree lacks comes from the repository's main checkout,
+the same place worktree setup scripts link them from. Files land `0600`.
+
+Runs without `--include` delete them from the mirror first. Test runs then see
+exactly what CI sees, not keys that happened to be left behind by a dev server.
+
 ### Environment and serialisation
 
 ```yaml
