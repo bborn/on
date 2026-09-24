@@ -631,9 +631,22 @@ func (d *DigitalOcean) Touch(s Server, now time.Time) error {
 	return nil
 }
 
-// Delete removes the droplet.
+// Delete removes the droplet, and then its last-used tag, which nothing else
+// carries: every droplet would otherwise leave one behind on the account.
 func (d *DigitalOcean) Delete(s Server) error {
-	return d.call("DELETE", fmt.Sprintf("/v2/droplets/%d", s.ID), nil, nil)
+	var got struct {
+		Droplet doDroplet `json:"droplet"`
+	}
+	_ = d.call("GET", fmt.Sprintf("/v2/droplets/%d", s.ID), nil, &got)
+	if err := d.call("DELETE", fmt.Sprintf("/v2/droplets/%d", s.ID), nil, nil); err != nil {
+		return err
+	}
+	for _, t := range got.Droplet.Tags {
+		if strings.HasPrefix(t, LabelLastUsed+":") {
+			d.deleteTagIfUnused(t)
+		}
+	}
+	return nil
 }
 
 // HourlyPrice is the size's hourly price, or 0 when unknown.

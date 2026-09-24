@@ -122,6 +122,11 @@ func (f *doFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "DELETE" && strings.HasPrefix(path, "/v2/droplets/"):
 		var id int64
 		fmt.Sscanf(path, "/v2/droplets/%d", &id)
+		if d := f.droplets[id]; d != nil {
+			for _, t := range d.Tags {
+				f.tags[t]--
+			}
+		}
 		delete(f.droplets, id)
 		w.WriteHeader(204)
 	case r.Method == "POST" && path == "/v2/tags":
@@ -244,6 +249,12 @@ func TestDigitalOceanListIsScopedAndTouchReplacesTheTag(t *testing.T) {
 	}
 	if _, left := f.tags["on-last-used:1790260000"]; left {
 		t.Fatal("the replaced last-used tag should be deleted once unused")
+	}
+	if err := d.Delete(servers[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, left := f.tags["on-last-used:1790263600"]; left {
+		t.Fatal("deleting the droplet should also delete its last-used tag")
 	}
 }
 
