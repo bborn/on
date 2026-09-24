@@ -227,7 +227,7 @@ func TestRunScriptUsesLoginShell(t *testing.T) {
 	// environment.
 	got := RunScript(Run{Path: "/m", Setup: "bundle install",
 		Cmd: []string{"bin/rails", "test"}})
-	if !strings.HasPrefix(got, "${SHELL:-/bin/sh} -lc ") {
+	if !strings.Contains(got, "exec ${SHELL:-/bin/sh} -lc ") {
 		t.Errorf("should run through a login shell: %q", got)
 	}
 	// The cd, setup and command must all share that shell's environment.
@@ -537,5 +537,42 @@ func TestRunScriptRemovesIncludesFirst(t *testing.T) {
 	}
 	if strings.Contains(RunScript(Run{Path: "~/m", Cmd: []string{"x"}}), "rm -f") {
 		t.Fatal("no Remove, no rm")
+	}
+}
+
+// The profile runs before anything inside the login shell, in the directory the
+// shell starts in. A profile that loads placeholder config only when the mirror
+// has no config/application.yml must start in the mirror, after stale include
+// files are gone, or the placeholders shadow the real config.
+func TestRunScriptProfileStartsInTheMirrorAfterRemoval(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh available")
+	}
+	home, mirror := t.TempDir(), t.TempDir()
+	profile := "if [ -f app.yml ]; then export SEEN=real; else export SEEN=placeholder; fi\n"
+	if err := os.WriteFile(filepath.Join(home, ".profile"), []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(mirror, "app.yml")
+	run := func(remove []string) string {
+		script := RunScript(Run{Path: mirror, Remove: remove, Cmd: []string{"sh", "-c", `echo "$SEEN"`}})
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Dir = home
+		cmd.Env = []string{"HOME=" + home, "SHELL=/bin/sh", "PATH=" + os.Getenv("PATH")}
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("script failed: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	if err := os.WriteFile(stale, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(nil); got != "real" {
+		t.Errorf("an --include run's profile should see the include file: got %q", got)
+	}
+	if got := run([]string{"app.yml"}); got != "placeholder" {
+		t.Errorf("a plain run's profile should not see the removed include file: got %q", got)
 	}
 }

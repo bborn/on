@@ -182,7 +182,7 @@ func TestListScopesToThePoolAndParses(t *testing.T) {
 
 func TestRenderSSHConfig(t *testing.T) {
 	out := RenderSSHConfig(pool, []Server{{Name: "on-ol-a", IP: "1.2.3.4"}, {Name: "on-ol-b"}})
-	if !strings.Contains(out, "Host on-ol-a\n  HostName 1.2.3.4\n  User dev\n") {
+	if !strings.Contains(out, "Host on-ol-a\n  HostName 1.2.3.4\n  HostKeyAlias on-ol-a\n  User dev\n") {
 		t.Fatalf("missing host block:\n%s", out)
 	}
 	if strings.Contains(out, "on-ol-b") {

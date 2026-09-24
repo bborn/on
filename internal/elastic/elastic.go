@@ -381,8 +381,12 @@ func IncludeLine() string {
 	return "Include " + filepath.Join(ConfigDir(), "ssh_config.d", "*.conf")
 }
 
-// RenderSSHConfig writes one Host block per server. Hetzner reuses IPs, so each
-// pool keeps its own known_hosts, and entries are forgotten when a server goes.
+// RenderSSHConfig writes one Host block per server.
+//
+// Hetzner hands a deleted server's IP to the next one, so host keys are recorded
+// under the server's name (HostKeyAlias), which is random and never reused,
+// rather than its IP. Otherwise a machine that did not delete the old server
+// still holds its key for that IP and refuses the new one as an impostor.
 func RenderSSHConfig(p inventory.Pool, servers []Server) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Written by `on` for pool %s. Regenerated on every listing; do not edit.\n", p.Name)
@@ -390,8 +394,8 @@ func RenderSSHConfig(p inventory.Pool, servers []Server) string {
 		if s.IP == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "\nHost %s\n  HostName %s\n  User %s\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile %s\n  ServerAliveInterval 30\n",
-			s.Name, s.IP, p.User, knownHostsPath(p.Name))
+		fmt.Fprintf(&b, "\nHost %s\n  HostName %s\n  HostKeyAlias %s\n  User %s\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile %s\n  ServerAliveInterval 30\n",
+			s.Name, s.IP, s.Name, p.User, knownHostsPath(p.Name))
 	}
 	return b.String()
 }
@@ -413,13 +417,11 @@ func WriteSSHConfig(p inventory.Pool, servers []Server) error {
 	return os.Rename(tmp, path)
 }
 
-// ForgetHostKey drops a deleted server's key, so the next server on that IP is
-// accepted rather than refused as an impostor.
+// ForgetHostKey drops a deleted server's key so known_hosts does not grow
+// forever. Keys are stored under the server name (see RenderSSHConfig), so a
+// machine that never runs this is merely left a stale line, not locked out.
 func ForgetHostKey(p inventory.Pool, s Server) {
-	if s.IP == "" {
-		return
-	}
-	_ = exec.Command("ssh-keygen", "-R", s.IP, "-f", knownHostsPath(p.Name)).Run()
+	_ = exec.Command("ssh-keygen", "-R", s.Name, "-f", knownHostsPath(p.Name)).Run()
 }
 
 // IncludeMissing reports whether ~/.ssh/config lacks the Include line.
