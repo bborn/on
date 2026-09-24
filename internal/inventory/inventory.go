@@ -64,30 +64,42 @@ type Inventory struct {
 // Pool is a set of on-demand hosts `on` creates from a snapshot when the fixed
 // hosts are short of memory, and deletes again once they sit idle.
 //
-// Only Hetzner is supported. `on` drives the hcloud CLI, so the API token lives in
-// an hcloud context rather than in this file, and anything hcloud can do by hand
-// stays possible alongside `on`.
+// A pool can draw on several providers. It states the size it needs (MinCPUs,
+// MinMemoryGB); `on` gathers every size and location each provider can boot the
+// pool's image on, converts the prices into the pool's currency, and tries them
+// cheapest first. Capacity is part of the answer: a sold-out type fails fast and
+// the next cheapest is tried, so a pool need not be tuned to one provider's stock.
 type Pool struct {
 	// Name is the inventory key, filled in during load.
 	Name string `yaml:"-"`
 
-	// Provider is "hetzner".
-	Provider string `yaml:"provider"`
-
-	// Context is the hcloud CLI context whose project holds the servers.
-	Context string `yaml:"context"`
-
-	// Image is the snapshot to boot, matched by its `on-image` label; the newest wins.
+	// Image is the snapshot to boot, matched by its `on-image` label (tag, on
+	// providers without labels); the newest wins. Each provider keeps its own.
 	Image string `yaml:"image"`
 
-	// Types and Locations are tried in order until one has capacity. Hetzner
-	// regularly runs out of a type in one location, so a single choice is not
-	// enough to rely on.
+	// MinCPUs and MinMemoryGB are the smallest server the pool will boot. Any
+	// type at least this big qualifies, whatever it is called.
+	MinCPUs     int     `yaml:"min_cpus"`
+	MinMemoryGB float64 `yaml:"min_memory_gb"`
+
+	// Providers maps a provider ("hetzner", "digitalocean") to its settings.
+	Providers map[string]ProviderConfig `yaml:"providers"`
+
+	// Currency is what DailyBudget and the spend ledger are counted in.
+	// Defaults to EUR.
+	Currency string `yaml:"currency"`
+
+	// Rates converts a provider's prices into Currency: 1 unit of the key is
+	// worth this much. Needed for any provider billing in another currency.
+	Rates map[string]float64 `yaml:"rates"`
+
+	// Provider, Context, Types, Locations and SSHKeys are the single-provider
+	// form, from before pools had several; Load folds them into Providers.
+	Provider  string   `yaml:"provider"`
+	Context   string   `yaml:"context"`
 	Types     []string `yaml:"types"`
 	Locations []string `yaml:"locations"`
-
-	// SSHKeys are hcloud ssh-key names installed on each server.
-	SSHKeys []string `yaml:"ssh_keys"`
+	SSHKeys   []string `yaml:"ssh_keys"`
 
 	// User is the login baked into the image. Defaults to "dev".
 	User string `yaml:"user"`
@@ -111,12 +123,63 @@ type Pool struct {
 	// should not run all week.
 	MaxHours int `yaml:"max_hours"`
 
-	// MaxServers caps how many servers the pool runs at once.
+	// MaxServers caps how many servers the pool runs at once, across providers.
 	MaxServers int `yaml:"max_servers"`
 
-	// DailyBudget caps what the pool may spend per UTC day, in the project's
-	// billing currency. Reaching it stops new servers and deletes running ones.
+	// DailyBudget caps what the pool may spend per UTC day, in Currency.
+	// Reaching it stops new servers and deletes running ones.
 	DailyBudget float64 `yaml:"daily_budget"`
+
+	// Build is a script that provisions a fresh server into the pool's image,
+	// given the server's IP as its argument; `on image build` runs it.
+	Build string `yaml:"build"`
+}
+
+// ProviderConfig is one provider's part of a pool.
+type ProviderConfig struct {
+	// Context is the hcloud CLI context (hetzner).
+	Context string `yaml:"context"`
+
+	// TokenFile is a dotenv file holding DIGITALOCEAN_ACCESS_TOKEN
+	// (digitalocean). Without it the variable is read from the environment.
+	TokenFile string `yaml:"token_file"`
+
+	// Locations are the locations (hetzner) or regions (digitalocean) servers
+	// may be created in. Required.
+	Locations []string `yaml:"locations"`
+
+	// Types, when set, limits the pool to these server types on this provider.
+	// Otherwise every type meeting the pool's minimum qualifies.
+	Types []string `yaml:"types"`
+
+	// SSHKeys are the provider's names for the keys installed on each server.
+	SSHKeys []string `yaml:"ssh_keys"`
+}
+
+// ProviderCurrency is the currency each supported provider bills in.
+var ProviderCurrency = map[string]string{
+	"hetzner":      "EUR",
+	"digitalocean": "USD",
+}
+
+// ProviderNames returns the pool's providers in stable order.
+func (p Pool) ProviderNames() []string {
+	names := make([]string, 0, len(p.Providers))
+	for n := range p.Providers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// Rate is what one unit of the given currency is worth in the pool's currency,
+// and whether the pool knows.
+func (p Pool) Rate(currency string) (float64, bool) {
+	if currency == p.Currency {
+		return 1, true
+	}
+	r, ok := p.Rates[currency]
+	return r, ok && r > 0
 }
 
 // Pool defaults, applied at load.
@@ -126,6 +189,7 @@ const (
 	DefaultPoolMaxHours    = 12
 	DefaultPoolMaxServers  = 2
 	DefaultPoolMinFreeMB   = 6000
+	DefaultPoolCurrency    = "EUR"
 )
 
 // ServesProject reports whether the pool can run the project.
@@ -341,11 +405,44 @@ func Load(path string) (*Inventory, error) {
 		if _, clash := inv.Hosts[name]; clash {
 			return nil, fmt.Errorf("pool %q has the same name as a host", name)
 		}
-		if p.Provider != "hetzner" {
-			return nil, fmt.Errorf("pool %q: provider must be \"hetzner\", got %q", name, p.Provider)
+		if p.Provider != "" {
+			if p.Providers == nil {
+				p.Providers = map[string]ProviderConfig{}
+			}
+			if _, dup := p.Providers[p.Provider]; dup {
+				return nil, fmt.Errorf("pool %q sets provider %q both ways; use providers:", name, p.Provider)
+			}
+			p.Providers[p.Provider] = ProviderConfig{Context: p.Context, Types: p.Types, Locations: p.Locations, SSHKeys: p.SSHKeys}
 		}
-		if p.Image == "" || len(p.Types) == 0 || len(p.Locations) == 0 {
-			return nil, fmt.Errorf("pool %q needs image, types and locations", name)
+		if p.Currency == "" {
+			// A single provider's own currency needs no rate; otherwise EUR.
+			p.Currency = DefaultPoolCurrency
+			if len(p.Providers) == 1 {
+				for pn := range p.Providers {
+					if cur, ok := ProviderCurrency[pn]; ok {
+						p.Currency = cur
+					}
+				}
+			}
+		}
+		if p.Image == "" || len(p.Providers) == 0 {
+			return nil, fmt.Errorf("pool %q needs an image and at least one provider", name)
+		}
+		for _, pn := range p.ProviderNames() {
+			pc := p.Providers[pn]
+			cur, known := ProviderCurrency[pn]
+			if !known {
+				return nil, fmt.Errorf("pool %q: unknown provider %q (supported: hetzner, digitalocean)", name, pn)
+			}
+			if len(pc.Locations) == 0 {
+				return nil, fmt.Errorf("pool %q: provider %s needs locations", name, pn)
+			}
+			if len(pc.Types) == 0 && p.MinCPUs <= 0 && p.MinMemoryGB <= 0 {
+				return nil, fmt.Errorf("pool %q: provider %s needs types, or the pool min_cpus/min_memory_gb", name, pn)
+			}
+			if _, ok := p.Rate(cur); !ok {
+				return nil, fmt.Errorf("pool %q: provider %s bills in %s; add rates: {%s: <value in %s>}", name, pn, cur, cur, p.Currency)
+			}
 		}
 		p.Name = name
 		if p.User == "" {

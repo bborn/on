@@ -43,6 +43,8 @@ elastic pools (on-demand servers booted from a snapshot, deleted when idle):
   on up <pool>                     start a server now
   on down <server>... | --pool <p> delete servers now
   on reap [--dry-run]              delete idle/over-age/over-budget servers (cron)
+  on offers <pool>                 what the pool would boot, cheapest first
+  on image build <pool> <provider> build the pool's image on that provider (its build: script)
 
 flags (before or just after <host>):
   -C <dir>      remote working directory
@@ -93,6 +95,10 @@ func run(args []string) error {
 		return cmdUp(args[1:])
 	case "down":
 		return cmdDown(args[1:])
+	case "offers":
+		return cmdOffers(args[1:])
+	case "image":
+		return cmdImage(args[1:])
 	case "reap":
 		return cmdReap(args[1:])
 	case "forward":
