@@ -472,3 +472,15 @@ func TestManagerRecordsWhichProvidersFailedToList(t *testing.T) {
 		t.Fatalf("a later successful List must clear Failed, got %v", m.Failed)
 	}
 }
+
+func TestBuilderPrefersTheSmallestDisk(t *testing.T) {
+	offers := []Offer{
+		{Type: "s-4vcpu-8gb", DiskGB: 160, Cost: 0.07},
+		{Type: "c-4", DiskGB: 50, Cost: 0.125},
+		{Type: "s5-4vcpu-8gb-50gb", DiskGB: 50, Cost: 0.10},
+	}
+	SortBuilderOffers(offers)
+	if offers[0].Type != "s5-4vcpu-8gb-50gb" || offers[1].Type != "c-4" || offers[2].Type != "s-4vcpu-8gb" {
+		t.Fatalf("want smallest disk first, then cheapest: %v", offers)
+	}
+}

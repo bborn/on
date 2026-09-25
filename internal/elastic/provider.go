@@ -238,6 +238,13 @@ func SortOffers(offers []Offer) {
 	})
 }
 
+// SortBuilderOffers orders builder candidates smallest disk first, then as
+// SortOffers does.
+func SortBuilderOffers(offers []Offer) {
+	SortOffers(offers)
+	sort.SliceStable(offers, func(i, j int) bool { return offers[i].DiskGB < offers[j].DiskGB })
+}
+
 // maxAttempts bounds one Create: past a dozen sold-out answers, the rest are
 // unlikely to differ, and each attempt is an API round trip.
 const maxAttempts = 12
@@ -289,6 +296,11 @@ func (m *Manager) CreateBuilder(kind, name string) (Server, Offer, error) {
 	if err != nil {
 		return Server{}, Offer{}, err
 	}
+	// Smallest disk first, then price: the builder's disk becomes the image's
+	// minimum, and a droplet or server with a smaller disk cannot boot it.
+	// DigitalOcean's 16 GB sizes have 30-80 GB disks, so an image built on its
+	// cheapest 4 CPU / 8 GB size (160 GB) fits none of them.
+	SortBuilderOffers(offers)
 	var failures []string
 	tried := 0
 	for _, o := range offers {
