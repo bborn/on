@@ -301,6 +301,11 @@ func cmdReap(args []string) error {
 	}
 	now := time.Now()
 	today := elastic.UTCDay(now)
+	// Pools (or providers within them) this run could not see. Their servers
+	// were neither charged nor reaped, so the run must fail where it is
+	// noticed (systemd, Fleet) instead of passing as "nothing to do": that
+	// silence once let two idle servers run for a week.
+	var blind []string
 
 	for _, pn := range inv.PoolNames() {
 		pool := inv.Elastic[pn]
@@ -308,7 +313,12 @@ func cmdReap(args []string) error {
 		servers, err := listPool(h)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", pn, err)
+			blind = append(blind, pn)
 			continue
+		}
+		for _, kind := range h.Failed {
+			fmt.Fprintf(os.Stderr, "%s: could not list %s: its servers are not charged or reaped this run\n", pn, kind)
+			blind = append(blind, pn+"/"+kind)
 		}
 
 		answered := h.Answered
@@ -386,10 +396,15 @@ func cmdReap(args []string) error {
 			_, _ = listPool(h)
 		}
 	}
-	if dry {
-		return nil
+	if !dry {
+		if err := ledger.Save(elastic.LedgerPath()); err != nil {
+			return err
+		}
 	}
-	return ledger.Save(elastic.LedgerPath())
+	if len(blind) > 0 {
+		return fmt.Errorf("could not see %s", strings.Join(blind, ", "))
+	}
+	return nil
 }
 
 // poolReport is what `on pools --json` prints, for dashboards.
