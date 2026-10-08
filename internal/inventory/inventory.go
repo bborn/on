@@ -114,12 +114,12 @@ type Pool struct {
 
 	// MinCPUs and MinMemoryGB are the smallest server the pool will boot. Any
 	// type at least this big qualifies, whatever it is called.
-	MinCPUs     int     `yaml:"min_cpus"`
+	MinCPUs int `yaml:"min_cpus"`
 
 	// Exec holds per-project overrides for runs on this pool's servers, layered
 	// over the project's exec env exactly as a fixed host's are.
-	Exec map[string]HostExec `yaml:"exec"`
-	MinMemoryGB float64 `yaml:"min_memory_gb"`
+	Exec        map[string]HostExec `yaml:"exec"`
+	MinMemoryGB float64             `yaml:"min_memory_gb"`
 
 	// Providers maps a provider ("hetzner", "digitalocean") to its settings.
 	Providers map[string]ProviderConfig `yaml:"providers"`
@@ -158,6 +158,15 @@ type Pool struct {
 	// IdleMinutes is how long a server may go unused before `on reap` deletes it.
 	IdleMinutes int `yaml:"idle_minutes"`
 
+	// ReapWindowMinutes applies to servers billed by the hour (see
+	// ProviderConfig.BillingMinutes). Such a server is paid for until the end of
+	// its current billing period whatever happens, so an idle one is kept, ready for
+	// the next run, and deleted only in the last ReapWindowMinutes of that period.
+	// IdleMinutes is not used for them. Defaults to DefaultPoolReapWindowMinutes,
+	// which leaves the 5-minute reap timer two chances to act before the next
+	// period starts.
+	ReapWindowMinutes int `yaml:"reap_window_minutes"`
+
 	// MaxHours deletes a server this old even if busy: a forgotten dev server
 	// should not run all week.
 	MaxHours int `yaml:"max_hours"`
@@ -176,6 +185,12 @@ type Pool struct {
 
 // ProviderConfig is one provider's part of a pool.
 type ProviderConfig struct {
+	// BillingMinutes is the provider's billing increment: a server is charged for
+	// every started period of this length. 0 means the provider's default:
+	// DefaultBillingMinutes, or per-second (no rounding worth waiting for) for
+	// providers not listed there.
+	BillingMinutes int `yaml:"billing_minutes"`
+
 	// Context is the hcloud CLI context (hetzner).
 	Context string `yaml:"context"`
 
@@ -223,12 +238,13 @@ func (p Pool) Rate(currency string) (float64, bool) {
 
 // Pool defaults, applied at load.
 const (
-	DefaultPoolUser        = "dev"
-	DefaultPoolIdleMinutes = 20
-	DefaultPoolMaxHours    = 12
-	DefaultPoolMaxServers  = 2
-	DefaultPoolMinFreeMB   = 6000
-	DefaultPoolCurrency    = "EUR"
+	DefaultPoolUser              = "dev"
+	DefaultPoolIdleMinutes       = 20
+	DefaultPoolReapWindowMinutes = 10
+	DefaultPoolMaxHours          = 12
+	DefaultPoolMaxServers        = 2
+	DefaultPoolMinFreeMB         = 6000
+	DefaultPoolCurrency          = "EUR"
 )
 
 // ServesProject reports whether the pool can run the project.
@@ -493,6 +509,9 @@ func Load(path string) (*Inventory, error) {
 		if p.IdleMinutes <= 0 {
 			p.IdleMinutes = DefaultPoolIdleMinutes
 		}
+		if p.ReapWindowMinutes <= 0 {
+			p.ReapWindowMinutes = DefaultPoolReapWindowMinutes
+		}
 		if p.MaxHours <= 0 {
 			p.MaxHours = DefaultPoolMaxHours
 		}
@@ -567,3 +586,17 @@ hosts:
 #     # test database they share is not.
 #     lock: myapp
 `
+
+// DefaultBillingMinutes holds providers' billing increments. Hetzner Cloud charges
+// every started hour. DigitalOcean has billed Droplets per second, with a
+// 60-second minimum, since 2026-01-01, so it is absent.
+var DefaultBillingMinutes = map[string]int{"hetzner": 60}
+
+// BillingMinutesFor returns the billing increment of a provider in this pool, or
+// 0 when it bills by the second.
+func (p Pool) BillingMinutesFor(provider string) int {
+	if c, ok := p.Providers[provider]; ok && c.BillingMinutes > 0 {
+		return c.BillingMinutes
+	}
+	return DefaultBillingMinutes[provider]
+}

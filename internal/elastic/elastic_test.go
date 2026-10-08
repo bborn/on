@@ -256,3 +256,39 @@ func TestHostCarriesThePoolsExecOverrides(t *testing.T) {
 		t.Fatalf("PARALLEL_WORKERS = %q, want 16", got)
 	}
 }
+
+func TestDecideKeepsAnHourlyServerUntilTheEndOfItsPaidHour(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	p := pool
+	p.ReapWindowMinutes = 10
+	at := func(minutesIntoHour, idleMin int) Server {
+		return Server{Provider: "hetzner", Name: "a", Status: "running",
+			Created:  now.Add(-time.Duration(60+minutesIntoHour) * time.Minute),
+			LastUsed: now.Add(-time.Duration(idleMin) * time.Minute)}
+	}
+	cases := []struct {
+		name string
+		s    Server
+		busy bool
+		del  bool
+	}{
+		{"idle long past idle_minutes, but 35m of the hour are paid: keep", at(25, 45), false, false},
+		{"idle in the last 10m of the hour: delete before the next is charged", at(52, 30), false, true},
+		{"idle 3m, at minute 55: delete — waiting buys nothing", at(55, 3), false, true},
+		{"handed to a run seconds ago, at minute 58: keep", at(58, 0), false, false},
+		{"busy at minute 58: keep", at(58, 30), true, false},
+	}
+	for _, c := range cases {
+		if got := Decide(p, c.s, c.busy, false, now); got.Delete != c.del {
+			t.Errorf("%s: delete=%v (%s)", c.name, got.Delete, got.Reason)
+		}
+	}
+}
+
+func TestDecidePerSecondProvidersKeepTheIdleRule(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	s := Server{Provider: "digitalocean", Name: "d", Status: "running", Created: now.Add(-25 * time.Minute), LastUsed: now.Add(-21 * time.Minute)}
+	if !Decide(pool, s, false, false, now).Delete {
+		t.Fatal("a per-second server idle past idle_minutes should go")
+	}
+}

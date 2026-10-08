@@ -274,11 +274,21 @@ elastic:
     user: dev                  # the login baked into the image
     serves: [myapp]
     min_free_mb: 8000          # below this on every fixed host, use the pool
-    idle_minutes: 20           # `on reap` deletes a server unused this long
+    idle_minutes: 20           # `on reap` deletes a server unused this long (per-second providers)
+    reap_window_minutes: 10    # hourly-billed servers: delete idle ones only in the last 10m of a paid hour
     max_hours: 12              # and any server this old, busy or not
     max_servers: 2             # across providers
     daily_budget: 5            # per UTC day, in currency
 ```
+
+**Paid hours are used, not thrown away.** Hetzner Cloud charges every started
+hour, so a server deleted after five minutes costs as much as one kept for fifty-five,
+and a run arriving later that hour would boot and pay for a second one. An idle
+server on an hourly provider is therefore kept, ready for the next run, and `on
+reap` deletes it only in the last `reap_window_minutes` of its current hour. Set a
+provider's `billing_minutes` to change its increment. DigitalOcean bills per
+second (with a 60-second minimum) and keeps the `idle_minutes` rule. Busy servers,
+`max_hours` and the daily budget work as before.
 
 Equal prices go to the location listed first. Hetzner is driven through the
 hcloud CLI; DigitalOcean through its API, with the token read from `token_file`
