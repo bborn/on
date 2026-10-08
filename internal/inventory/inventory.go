@@ -115,6 +115,10 @@ type Pool struct {
 	// MinCPUs and MinMemoryGB are the smallest server the pool will boot. Any
 	// type at least this big qualifies, whatever it is called.
 	MinCPUs     int     `yaml:"min_cpus"`
+
+	// Exec holds per-project overrides for runs on this pool's servers, layered
+	// over the project's exec env exactly as a fixed host's are.
+	Exec map[string]HostExec `yaml:"exec"`
 	MinMemoryGB float64 `yaml:"min_memory_gb"`
 
 	// Providers maps a provider ("hetzner", "digitalocean") to its settings.

@@ -248,3 +248,11 @@ func TestRenderSSHConfig(t *testing.T) {
 		t.Fatal("a server without an IP yet should be skipped")
 	}
 }
+
+func TestHostCarriesThePoolsExecOverrides(t *testing.T) {
+	p := inventory.Pool{Workdir: "~/w", Exec: map[string]inventory.HostExec{"myapp": {Env: map[string]string{"PARALLEL_WORKERS": "16"}}}}
+	h := Host(p, Server{Name: "on-cloud-1"})
+	if got := h.ExecEnv("myapp", map[string]string{"PARALLEL_WORKERS": "1"})["PARALLEL_WORKERS"]; got != "16" {
+		t.Fatalf("PARALLEL_WORKERS = %q, want 16", got)
+	}
+}

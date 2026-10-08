@@ -238,7 +238,7 @@ mid-suite sends the next run to the next host, or to the pool, instead of queuei
 it. When every fixed host is passed over and there is no pool, the run queues on
 the first by priority, behind its lock.
 
-A host's `exec.<project>.env` wins over the project's `env`. That lets one big host
+A host's (or a pool's) `exec.<project>.env` wins over the project's `env`. That lets one big host
 lift a limit that exists to protect small ones, such as `PARALLEL_WORKERS: "1"`.
 
 ## Elastic pools
