@@ -83,11 +83,39 @@ func Decide(p inventory.Pool, s Server, busy, overBudget bool, now time.Time) Ve
 		return Verdict{s, true, "not running (" + s.Status + ") but still billed"}
 	case busy:
 		return Verdict{s, false, "busy"}
+	}
+	if period := time.Duration(p.BillingMinutesFor(s.Provider)) * time.Minute; period > 0 {
+		return decidePaidPeriod(p, s, age, idle, period)
+	}
+	switch {
 	case idle >= time.Duration(p.IdleMinutes)*time.Minute:
 		return Verdict{s, true, fmt.Sprintf("idle %s", idle.Round(time.Minute))}
 	default:
 		return Verdict{s, false, fmt.Sprintf("idle %s of %dm", idle.Round(time.Minute), p.IdleMinutes)}
 	}
+}
+
+// recentUseGrace keeps a server that `on` touched moments ago: placement marks
+// it used before the run's first process starts, which BusyScript cannot see yet.
+const recentUseGrace = 2 * time.Minute
+
+// decidePaidPeriod handles an idle server on a provider that charges every started
+// billing period. Deleting it early saves nothing — the period is already paid —
+// and a run arriving later in the period would boot, and pay for, a second
+// server. So it is kept, ready to reuse, until the last ReapWindowMinutes of the
+// period, and deleted then, before the next period is charged.
+func decidePaidPeriod(p inventory.Pool, s Server, age, idle, period time.Duration) Verdict {
+	left := period - age%period
+	window := time.Duration(p.ReapWindowMinutes) * time.Minute
+	if idle < recentUseGrace {
+		// Just handed to a run that may not have started a process yet.
+		return Verdict{s, false, fmt.Sprintf("used %s ago", idle.Round(time.Second))}
+	}
+	if left > window {
+		return Verdict{s, false, fmt.Sprintf("idle %s, paid for %s more; deleting in the last %dm",
+			idle.Round(time.Minute), left.Round(time.Minute), p.ReapWindowMinutes)}
+	}
+	return Verdict{s, true, fmt.Sprintf("idle %s, %s left of its paid period", idle.Round(time.Minute), left.Round(time.Minute))}
 }
 
 // BusyScript prints "busy" when anything user-driven is running: a tmux session,

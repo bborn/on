@@ -340,3 +340,10 @@ exec:
 		t.Fatalf("priority = %d", inv.Hosts["big"].Priority)
 	}
 }
+
+func TestBillingMinutesDefaultsAndOverrides(t *testing.T) {
+	p := Pool{Providers: map[string]ProviderConfig{"hetzner": {}, "digitalocean": {}, "other": {BillingMinutes: 30}}}
+	if p.BillingMinutesFor("hetzner") != 60 || p.BillingMinutesFor("digitalocean") != 0 || p.BillingMinutesFor("other") != 30 {
+		t.Fatalf("hetzner=%d digitalocean=%d other=%d", p.BillingMinutesFor("hetzner"), p.BillingMinutesFor("digitalocean"), p.BillingMinutesFor("other"))
+	}
+}
