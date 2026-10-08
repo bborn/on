@@ -304,3 +304,39 @@ func TestLoadPoolWithOneProviderUsesItsCurrency(t *testing.T) {
 		t.Fatalf("currency = %q, want USD", c)
 	}
 }
+
+func TestHostExecEnvLayersOverProjectEnv(t *testing.T) {
+	inv, err := Load(write(t, `
+hosts:
+  big:
+    ssh: big
+    priority: -1
+    repos: {myapp: ~/myapp}
+    exec:
+      myapp:
+        env: {PARALLEL_WORKERS: "32"}
+  small:
+    ssh: small
+    repos: {myapp: ~/myapp}
+exec:
+  myapp:
+    env: {PARALLEL_WORKERS: "1", RAILS_ENV: test}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := inv.ExecFor("myapp").Env
+	big := inv.Hosts["big"].ExecEnv("myapp", base)
+	if big["PARALLEL_WORKERS"] != "32" || big["RAILS_ENV"] != "test" {
+		t.Fatalf("big env = %v", big)
+	}
+	if base["PARALLEL_WORKERS"] != "1" {
+		t.Fatalf("project env was modified: %v", base)
+	}
+	if inv.Hosts["small"].ExecEnv("myapp", base)["PARALLEL_WORKERS"] != "1" {
+		t.Fatal("a host without overrides must get the project env")
+	}
+	if inv.Hosts["big"].Priority != -1 {
+		t.Fatalf("priority = %d", inv.Hosts["big"].Priority)
+	}
+}
