@@ -57,6 +57,7 @@ func Host(p inventory.Pool, s Server) inventory.Host {
 		SSH:          s.Name,
 		Workdir:      p.Workdir,
 		Capabilities: p.Capabilities,
+		Exec:         p.Exec,
 	}
 }
 

@@ -217,6 +217,30 @@ Point an agent at it from `CLAUDE.md` or `AGENTS.md`:
 
 > Run tests with `on exec bin/rails test`, never `bin/rails test`.
 
+### Preferring a host, and per-host overrides
+
+```yaml
+hosts:
+  bigbox:
+    ssh: bigbox
+    priority: -1          # tried first by `on exec`; default 0
+    repos: {myapp: ~/projects/myapp}
+    exec:
+      myapp:
+        env:
+          PARALLEL_WORKERS: "32"   # layered over the project's exec env on this host
+```
+
+`on exec` tries fixed hosts by `priority`, lowest first, and among equals by most
+free memory. A host is passed over when it is short of memory or, for a project
+with a `lock`, already running that project. So a big preferred box that is
+mid-suite sends the next run to the next host, or to the pool, instead of queueing
+it. When every fixed host is passed over and there is no pool, the run queues on
+the first by priority, behind its lock.
+
+A host's (or a pool's) `exec.<project>.env` wins over the project's `env`. That lets one big host
+lift a limit that exists to protect small ones, such as `PARALLEL_WORKERS: "1"`.
+
 ## Elastic pools
 
 Fixed hosts are the cheap default. When none of them has room, `on exec` can boot

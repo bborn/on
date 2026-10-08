@@ -32,20 +32,16 @@ func placeForExec(inv *inventory.Inventory, repo string) (placement, error) {
 		return placement{host: h, done: func() {}}, err
 	}
 
-	best, bestFree := inventory.Host{}, -1
+	var sts []fleet.Status
 	if candidates := inv.HostsFor(repo); len(candidates) > 0 {
-		for _, st := range fleet.Probe(candidates, false) {
-			if st.Reachable && st.AvailMB > bestFree {
-				best, bestFree = st.Host, st.AvailMB
-			}
-		}
+		sts = fleet.Probe(candidates, false)
 	}
-	if bestFree >= pool.MinFreeMB {
-		return placement{host: best, done: func() {}}, nil
+	if h, _, ok := chooseHost(sts, pool.MinFreeMB, lockBusy(inv.ExecFor(repo))); ok {
+		return placement{host: h, done: func() {}}, nil
 	}
-	if bestFree >= 0 {
-		fmt.Fprintf(os.Stderr, "  fixed hosts are short of memory (best: %s, %dM free < %dM) — using pool %s\n",
-			best.Name, bestFree, pool.MinFreeMB, pool.Name)
+	if len(sts) > 0 {
+		fmt.Fprintf(os.Stderr, "  no fixed host has room (%dM free) and is idle for %s — using pool %s\n",
+			pool.MinFreeMB, repo, pool.Name)
 	}
 	return acquire(pool, false)
 }

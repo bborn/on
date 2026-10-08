@@ -41,6 +41,41 @@ type Host struct {
 	// ~/projects/engineering on one host and ~/Projects/myapp on another, so
 	// the mapping has to be explicit rather than inferred from the path.
 	Repos map[string]string `yaml:"repos"`
+
+	// Priority orders fixed hosts for `on exec`, lowest first. A host is passed
+	// over for the next one, or the project's pool, only when it is short of
+	// memory or, for a project with a lock, already running that project. Hosts
+	// that share a priority fall back to the most-free-memory rule, so leaving it
+	// unset everywhere keeps the old behaviour.
+	Priority int `yaml:"priority"`
+
+	// Exec holds per-project overrides for runs on this host. Its env is layered
+	// over the project's, so a big host can lift a limit that exists to protect
+	// small ones, such as PARALLEL_WORKERS.
+	Exec map[string]HostExec `yaml:"exec"`
+}
+
+// HostExec is one project's run overrides on one host.
+type HostExec struct {
+	// Env is exported after, and so wins over, the project's exec env.
+	Env map[string]string `yaml:"env"`
+}
+
+// ExecEnv returns the environment a run of project gets on this host: the
+// project's env with this host's overrides on top. base is not modified.
+func (h Host) ExecEnv(project string, base map[string]string) map[string]string {
+	over := h.Exec[project].Env
+	if len(over) == 0 {
+		return base
+	}
+	out := make(map[string]string, len(base)+len(over))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range over {
+		out[k] = v
+	}
+	return out
 }
 
 // DefaultWorkdir is used when a host does not set one.
@@ -80,6 +115,10 @@ type Pool struct {
 	// MinCPUs and MinMemoryGB are the smallest server the pool will boot. Any
 	// type at least this big qualifies, whatever it is called.
 	MinCPUs     int     `yaml:"min_cpus"`
+
+	// Exec holds per-project overrides for runs on this pool's servers, layered
+	// over the project's exec env exactly as a fixed host's are.
+	Exec map[string]HostExec `yaml:"exec"`
 	MinMemoryGB float64 `yaml:"min_memory_gb"`
 
 	// Providers maps a provider ("hetzner", "digitalocean") to its settings.

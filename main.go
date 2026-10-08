@@ -321,16 +321,16 @@ func pickHostFor(inv *inventory.Inventory, repo string) (inventory.Host, error) 
 		return candidates[0], nil
 	}
 
-	best, bestFree := inventory.Host{}, -1
-	for _, st := range fleet.Probe(candidates, false) {
-		if st.Reachable && st.AvailMB > bestFree {
-			best, bestFree = st.Host, st.AvailMB
-		}
+	sts := fleet.Probe(candidates, false)
+	if h, _, ok := chooseHost(sts, 0, lockBusy(inv.ExecFor(repo))); ok {
+		return h, nil
 	}
-	if bestFree < 0 {
-		return inventory.Host{}, fmt.Errorf("no reachable host serves %q", repo)
+	// Every reachable host is busy: queue on the first in priority order, where
+	// the project's lock serialises the run behind the one already going.
+	if h, _, ok := chooseHost(sts, 0, nil); ok {
+		return h, nil
 	}
-	return best, nil
+	return inventory.Host{}, fmt.Errorf("no reachable host serves %q", repo)
 }
 
 func cmdAttach(args []string) error {
@@ -810,7 +810,7 @@ func cmdExec(args []string) error {
 
 	run := mirror.Run{
 		Path:          remotePath,
-		Env:           cfg.Env,
+		Env:           host.ExecEnv(repo, cfg.Env),
 		Setup:         cfg.Setup,
 		Prepare:       cfg.Prepare,
 		PrepareInputs: cfg.PrepareInputs,
