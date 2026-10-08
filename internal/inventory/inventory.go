@@ -313,11 +313,10 @@ type ExecConfig struct {
 	// Env is exported before Setup, Prepare and the command.
 	//
 	// This exists so a project can state the environment its remote runs need
-	// once, instead of every caller remembering to prefix it. `PARALLEL_WORKERS:
-	// "1"` is the motivating case: above Rails' 50-test parallelisation
-	// threshold, forked workers truncating tables against a live connection
-	// deadlock in Postgres, producing a wall of errors and zero assertion
-	// failures — a red suite with no regression behind it.
+	// once, instead of every caller remembering to prefix it, such as the
+	// test worker count. Avoid `PARALLEL_WORKERS` for a Rails app: Rails lets it
+	// override the worker count, and `"1"` quietly runs every suite in one
+	// process.
 	Env map[string]string `yaml:"env"`
 
 	// Include lists gitignored files to sync anyway, relative to the tree: the
@@ -580,7 +579,7 @@ hosts:
 #     prepare_inputs: [app/assets, app/javascript, package.json]
 #
 #     env:                            # exported before setup, prepare and cmd
-#       PARALLEL_WORKERS: "1"
+#       TEST_WORKERS: "16"
 #
 #     # Serialise runs sharing this name on a host. Mirrors are isolated; the
 #     # test database they share is not.
