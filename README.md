@@ -197,12 +197,17 @@ exactly what CI sees, not keys that happened to be left behind by a dev server.
 exec:
   myapp:
     env:
-      PARALLEL_WORKERS: "1"
+      TEST_WORKERS: "16"
     lock: myapp
 ```
 
 `env` is exported before setup, prepare and the command, so a project states its
 remote environment once instead of every caller remembering to prefix it.
+
+Don't set `PARALLEL_WORKERS` here for a Rails app: Rails lets it override the
+worker count the test helper asks for, so `"1"` quietly runs every suite in one
+process. If parallel workers run out of Postgres locks ("out of shared memory"),
+raise `max_locks_per_transaction` on the host instead.
 
 `lock` serialises runs sharing that name on a host. Mirrors are isolated from
 each other; the things they talk to are not. Two concurrent `on exec` test runs
