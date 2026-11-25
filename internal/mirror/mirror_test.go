@@ -576,3 +576,21 @@ func TestRunScriptProfileStartsInTheMirrorAfterRemoval(t *testing.T) {
 		t.Errorf("a plain run's profile should not see the removed include file: got %q", got)
 	}
 }
+
+func TestRunScriptSlotsTakeFirstFreeSlotAndExportSlotEnv(t *testing.T) {
+	script := RunScript(Run{
+		Path:    "~/projects/.on-mirrors/app-1",
+		Lock:    "~/projects/.on-mirrors/.locks/app.lock",
+		Slots:   3,
+		SlotEnv: map[string]string{"REDIS_URL": "redis://localhost:6379/$((10 + ON_SLOT))"},
+		Cmd:     []string{"true"},
+	})
+	for _, want := range []string{"seq 1 3", ".$ON_SLOT.lock", "exec 9>", "flock -n 9 && break 2", "export ON_SLOT", `export REDIS_URL="redis://localhost:6379/$((10 + ON_SLOT))"`} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script missing %q:\n%s", want, script)
+		}
+	}
+	if strings.Index(script, "export ON_SLOT") > strings.Index(script, "export REDIS_URL") {
+		t.Errorf("slot env must be exported after the slot is taken")
+	}
+}

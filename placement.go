@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
 
 	"github.com/bborn/on/internal/fleet"
 	"github.com/bborn/on/internal/inventory"
@@ -50,6 +51,21 @@ func lockBusy(cfg inventory.ExecConfig) func(inventory.Host) bool {
 		return nil
 	}
 	return func(h inventory.Host) bool {
+		// With slots the host is busy only when every slot is held.
+		if cfg.Slots > 1 {
+			path := mirror.LockPath(h.Workdir, cfg.Lock)
+			base := strings.TrimSuffix(path, ".lock")
+			for i := 1; i <= cfg.Slots; i++ {
+				slot := path
+				if i > 1 {
+					slot = fmt.Sprintf("%s.%d.lock", base, i)
+				}
+				if !lockHeld(h, slot) {
+					return false
+				}
+			}
+			return true
+		}
 		return lockHeld(h, mirror.LockPath(h.Workdir, cfg.Lock))
 	}
 }
