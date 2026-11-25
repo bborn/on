@@ -822,6 +822,7 @@ func cmdExec(args []string) error {
 	}
 	if cfg.Lock != "" {
 		run.Lock = mirror.LockPath(host.Workdir, cfg.Lock)
+		run.Slots, run.SlotEnv = cfg.Slots, cfg.SlotEnv
 	}
 
 	script := mirror.RunScript(run)

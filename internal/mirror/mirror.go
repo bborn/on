@@ -239,6 +239,11 @@ type Run struct {
 	// prepare and the command. Empty means no lock.
 	Lock string
 
+	// Slots, when above 1, turns Lock into that many lock files (NAME.lock, then NAME.2.lock...); the run takes the first free one and exports
+	// ON_SLOT. SlotEnv is exported after that, as double-quoted shell text.
+	Slots   int
+	SlotEnv map[string]string
+
 	// Remove lists paths, relative to the mirror, deleted before anything runs:
 	// include files a previous --include run left that this run must not see.
 	Remove []string
@@ -291,7 +296,12 @@ func RunScript(r Run) string {
 	if r.Setup != "" {
 		fmt.Fprintf(&inner, "%s || exit $?\n", r.Setup)
 	}
-	if r.Lock != "" {
+	if r.Lock != "" && r.Slots > 1 {
+		writeSlotLock(&inner, r.Lock, r.Slots)
+		for _, k := range sortedKeys(r.SlotEnv) {
+			fmt.Fprintf(&inner, "export %s=\"%s\"\n", k, r.SlotEnv[k])
+		}
+	} else if r.Lock != "" {
 		writeLock(&inner, r.Lock)
 	}
 	if r.Prepare != "" && r.Stamp != "" {
@@ -325,6 +335,34 @@ func writeLock(w *strings.Builder, lockPath string) {
 	fmt.Fprintf(w, "else\n")
 	fmt.Fprintf(w, "  printf 'on: no flock on this host; %%s runs unserialised\\n' %s >&2\n", name)
 	fmt.Fprintf(w, "fi\n")
+}
+
+// writeSlotLock is writeLock with n lock files: the run polls for the first
+// free slot, holds it on fd 9 the same way, and exports ON_SLOT. Without flock
+// it runs unserialised as slot 1, with the same warning.
+func writeSlotLock(w *strings.Builder, lockPath string, n int) {
+	dir := remote.QuotePath(path.Dir(lockPath))
+	base := strings.TrimSuffix(lockPath, ".lock")
+	name := remote.Quote(strings.TrimSuffix(path.Base(lockPath), ".lock"))
+	// The ~ in a quoted path expands via QuotePath; the slot number is appended outside it.
+	fmt.Fprintf(w, "mkdir -p %s || exit 1\n", dir)
+	fmt.Fprintf(w, "if command -v flock >/dev/null 2>&1; then\n")
+	fmt.Fprintf(w, "  waited=\n")
+	fmt.Fprintf(w, "  while :; do\n")
+	fmt.Fprintf(w, "    for ON_SLOT in $(seq 1 %d); do\n", n)
+	// Slot 1 is the plain NAME.lock, so a run from an older `on` (one exclusive
+	// lock) still excludes slot 1 and can never overlap it.
+	fmt.Fprintf(w, "      if [ $ON_SLOT = 1 ]; then exec 9>%s || exit 1; else exec 9>%s.$ON_SLOT.lock || exit 1; fi\n", remote.QuotePath(lockPath), remote.QuotePath(base))
+	fmt.Fprintf(w, "      flock -n 9 && break 2\n")
+	fmt.Fprintf(w, "    done\n")
+	fmt.Fprintf(w, "    [ -n \"$waited\" ] || printf '→ waiting for a %%s slot\\n' %s >&2; waited=1\n", name)
+	fmt.Fprintf(w, "    sleep 2\n")
+	fmt.Fprintf(w, "  done\n")
+	fmt.Fprintf(w, "else\n")
+	fmt.Fprintf(w, "  ON_SLOT=1\n")
+	fmt.Fprintf(w, "  printf 'on: no flock on this host; %%s runs unserialised\\n' %s >&2\n", name)
+	fmt.Fprintf(w, "fi\n")
+	fmt.Fprintf(w, "export ON_SLOT\n")
 }
 
 // writePrepare emits the staleness check around the prepare step.

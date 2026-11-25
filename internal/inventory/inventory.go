@@ -334,6 +334,19 @@ type ExecConfig struct {
 	// uses. The lock is per host and named rather than implicit, so cheap
 	// commands are not made to queue behind test suites.
 	Lock string `yaml:"lock"`
+
+	// Slots lets that many runs hold the lock at once. 0 or 1 is the single
+	// exclusive lock. A run takes the first free slot (slot 1 is NAME.lock, the rest NAME.2.lock...),
+	// waits when all are taken, and exports ON_SLOT=N (1-based).
+	//
+	// Use it only for a project whose shared host state is partitioned by slot:
+	// SlotEnv below is how each slot gets its own.
+	Slots int `yaml:"slots"`
+
+	// SlotEnv is exported after a slot is taken. Values are double-quoted shell
+	// text, so they can do arithmetic on $ON_SLOT, e.g.
+	// CAPYBARA_SERVER_PORT: "$((3100 + ON_SLOT))".
+	SlotEnv map[string]string `yaml:"slot_env"`
 }
 
 // ExecFor returns the whole exec configuration for a project. The zero value is
